@@ -1,0 +1,9 @@
+data/
+venv/
+*.zip
+*.rar
+smoke_test_out*.mp4
+.git/
+__pycache__/
+*.pt
+!runs/detect/plan_a_yolov8/weights/best.pt

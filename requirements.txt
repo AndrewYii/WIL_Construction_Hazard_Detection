@@ -4,3 +4,5 @@ ultralytics
 roboflow
 datasets
 huggingface_hub
+streamlit
+opencv-python
