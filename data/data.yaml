@@ -1,5 +1,6 @@
-path: ../data/processed
+path: C:\Users\User\Desktop\WIL\WIL_Construction_Hazard_Detection\data\processed
 train: images/train
+val: images/test
 test: images/test
 
 nc: 2
