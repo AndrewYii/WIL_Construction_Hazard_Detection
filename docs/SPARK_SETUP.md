@@ -22,11 +22,12 @@ first available from each chain):
 ```bash
 # Phase 2 report writer chain
 ollama pull gpt-oss:120b      # ~65 GB — main report model (MoE, fast per token)
+ollama pull gemma4:31b        # ~20 GB — strong fallback (dense, Apr 2026)
 ollama pull qwen3:32b         # ~20 GB — fast fallback
 
 # VLM chain (Plan D, frame understanding)
-ollama pull qwen2.5vl:32b     # ~21 GB — main VLM
-ollama pull gemma3:27b        # ~17 GB — fallback
+ollama pull gemma4:26b        # ~18 GB — main VLM (MoE, ~4B active params, fast + vision)
+ollama pull qwen2.5vl:32b     # ~21 GB — fallback / comparison
 ollama pull llava:7b          # ~4.7 GB — last resort
 ```
 

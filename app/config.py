@@ -33,12 +33,12 @@ OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "120"))
 # Pull on the Spark with:  ollama pull gpt-oss:120b   etc. (docs/SPARK_SETUP.md)
 REPORT_MODELS = [
     m.strip() for m in os.environ.get(
-        "REPORT_MODELS", "gpt-oss:120b,qwen3:32b,llama3.3:70b,llava:7b"
+        "REPORT_MODELS", "gpt-oss:120b,gemma4:31b,qwen3:32b,llama3.3:70b,llava:7b"
     ).split(",") if m.strip()
 ]
 VLM_MODELS = [
     m.strip() for m in os.environ.get(
-        "VLM_MODELS", "qwen2.5vl:32b,gemma3:27b,llava:7b"
+        "VLM_MODELS", "gemma4:26b,qwen2.5vl:32b,gemma3:27b,llava:7b"
     ).split(",") if m.strip()
 ]
 
