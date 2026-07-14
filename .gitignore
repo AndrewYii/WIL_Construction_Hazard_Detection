@@ -21,4 +21,6 @@ build/
 *.tar.gz
 *.mp4
 *.docx
+logs/
+assets/audio/
 

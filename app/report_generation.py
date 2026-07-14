@@ -1,14 +1,13 @@
 """
 Phase 2: LLM-generated safety report from the Phase 1 detection report dict.
 
-Uses a local Ollama model with a small built-in safety-regulation reference
-block injected into the prompt (lightweight RAG). Falls back to a templated
-markdown report if the LLM call fails, so the app never crashes.
+Uses the Ollama server on the NVIDIA DGX Spark (config.OLLAMA_HOST, port
+11434) through llm_client. The model preference chain (config.REPORT_MODELS,
+default gpt-oss:120b -> qwen3:32b) resolves to whatever is actually pulled on
+the server. A small built-in safety-regulation reference block is injected
+into the prompt (lightweight RAG). Falls back to a templated markdown report
+if the server or every model is unavailable, so the app never crashes.
 """
-
-# glm-5:cloud is pulled but needs a paid subscription (403), so the local
-# llava:7b is tried first.
-MODELS = ["llava:7b", "glm-5:cloud"]
 
 # Static safety reference snippets injected into the prompt so the report
 # grounds its recommendations in named rules instead of generic advice.
@@ -183,23 +182,24 @@ def report_to_pdf(markdown_text: str) -> bytes:
     return bytes(pdf.output())
 
 
+def _clean_llm_text(text: str) -> str:
+    """Strip code fences and any <think>...</think> reasoning block that
+    thinking models (qwen3, deepseek-r1) prepend."""
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("markdown").strip()
+    return text
+
+
 def generate_hazard_report(report: dict) -> str:
     try:
-        import ollama
-        prompt = _build_prompt(report)
-        for model in MODELS:
-            try:
-                response = ollama.chat(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                text = response["message"]["content"].strip()
-                if text.startswith("```"):
-                    text = text.strip("`").removeprefix("markdown").strip()
-                if text and "## Site Safety Report" in text:
-                    return text
-            except Exception:
-                continue
+        from llm_client import get_client
+        text = get_client().generate_report(_build_prompt(report))
+        if text:
+            text = _clean_llm_text(text)
+            if "## Site Safety Report" in text:
+                return text
     except Exception:
         pass
     return _fallback_report(report)

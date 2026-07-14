@@ -1,10 +1,15 @@
 """
-Post-detection hazard logic (Plan A).
+Post-detection hazard logic.
 Classes: worker (0), dangerous_vehicle (1).
 
-Proximity hazard: a worker box and a vehicle box are close enough
-(by normalized center distance or box overlap) to count as a risk.
-Height hazard is not implemented yet (no labeled data source, per project plan).
+Three hazard use cases, all computed on top of raw detections:
+  - Proximity: a worker box and a vehicle box are close enough
+    (by normalized center distance or box overlap) to count as a risk.
+  - Vehicle movement: a vehicle centroid displacing fast enough across
+    detection passes while workers are on site (moving machinery caution).
+  - Height (EXPERIMENTAL heuristic): a worker whose box sits in the upper
+    zone of the frame — a stand-in until height-labeled/synthetic data
+    exists; off by default (config.HEIGHT_ZONE_ENABLED).
 """
 
 from dataclasses import dataclass
@@ -54,3 +59,46 @@ def find_proximity_hazards(detections: list[Detection], frame_diag: float, dista
             if boxes_overlap(w.xyxy, v.xyxy) or box_distance(w.xyxy, v.xyxy) < threshold:
                 hazards.append((w, v))
     return hazards
+
+
+def find_height_hazards(detections: list[Detection], frame_height: float,
+                        zone_fraction: float = 0.45):
+    """EXPERIMENTAL: workers whose box bottom sits above zone_fraction of the
+    frame height (i.e. visually elevated). A camera-geometry heuristic, not a
+    trained signal — real height detection needs the synthetic data planned
+    for the height-hazard gap."""
+    limit = frame_height * zone_fraction
+    return [d for d in detections if d.cls == WORKER and d.xyxy[3] < limit]
+
+
+class VehicleMotionTracker:
+    """Tracks vehicle centroids across detection passes and flags vehicles
+    moving faster than move_ratio_per_sec (fraction of frame diagonal per
+    second). Association is nearest-centroid — adequate for the few large
+    machines a site camera sees at once."""
+
+    def __init__(self, frame_diag: float, move_ratio_per_sec: float = 0.04):
+        self.frame_diag = frame_diag
+        self.threshold_per_sec = frame_diag * move_ratio_per_sec
+        self._last: list[tuple[float, float]] = []
+        self._last_time: float | None = None
+
+    def update(self, detections: list[Detection], now: float) -> list[Detection]:
+        """Returns the vehicles considered to be in motion this pass."""
+        vehicles = [d for d in detections if d.cls == VEHICLE]
+        centers = [box_center(d.xyxy) for d in vehicles]
+        moving = []
+        if self._last and self._last_time is not None:
+            dt = max(now - self._last_time, 1e-3)
+            # cap dt so a long stall doesn't make everything look stationary
+            dt = min(dt, 2.0)
+            for det, (cx, cy) in zip(vehicles, centers):
+                dist = min(((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                           for px, py in self._last)
+                # ignore jumps larger than 1/4 diagonal: that's a new vehicle
+                # or an association error, not motion
+                if self.threshold_per_sec * dt < dist < self.frame_diag * 0.25:
+                    moving.append(det)
+        self._last = centers
+        self._last_time = now
+        return moving

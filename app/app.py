@@ -13,8 +13,10 @@ from pathlib import Path
 import streamlit as st
 import torch
 
+import config
 from detectors import DETECTOR_REGISTRY, create_detector
 from inference import process_video
+from llm_client import get_client
 from report_generation import generate_hazard_report, hazard_intervals, report_to_pdf
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +26,11 @@ DEFAULT_WEIGHTS = PROJECT_ROOT / "runs" / "detect" / "plan_a_yolov8" / "weights"
 @st.cache_resource(show_spinner="Loading detector...")
 def get_detector(approach: str, weights_path: str, device: str):
     return create_detector(approach, weights_path=weights_path, device=device)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def spark_status():
+    return get_client().status()
 
 st.set_page_config(page_title="Construction Hazard Detection", page_icon="🚧", layout="wide")
 
@@ -268,6 +275,27 @@ st.markdown(
 st.title("Construction Hazard Detection")
 st.caption("Upload site footage to detect workers, dangerous vehicles, and proximity hazards, "
            "then generate a structured safety report.")
+
+with st.sidebar:
+    st.subheader("Spark LLM server")
+    status = spark_status()
+    if status["up"]:
+        st.success(f"Connected — {status['host']}")
+        st.caption(f"Report model: `{status['report_model'] or 'none from chain'}`")
+        st.caption(f"VLM (Plan D): `{status['vlm_model'] or 'none from chain'}`")
+        with st.expander(f"{len(status['models'])} models on server"):
+            for m in status["models"]:
+                st.markdown(f"- `{m}`")
+    else:
+        st.error(f"Offline — {status['host']}")
+        st.caption("Set OLLAMA_HOST=http://<spark-ip>:11434. "
+                   "Reports fall back to the built-in template.")
+    st.divider()
+    st.subheader("Live monitoring")
+    st.caption("Real-time streaming with voice alerts runs separately:")
+    st.code("python app/live.py --headless", language="bash")
+    st.caption("Then open http://<host>:8090 in a browser. "
+               "Use cases: proximity, vehicle movement, height (experimental).")
 
 left, right = st.columns([1, 1], gap="large")
 

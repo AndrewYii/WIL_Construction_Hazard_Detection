@@ -9,6 +9,7 @@ subclass BaseDetector and add one entry to DETECTOR_REGISTRY.
 
 from pathlib import Path
 
+import config
 from hazard_logic import Detection
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -207,10 +208,12 @@ class _GroundingDINO:
 
 
 class PlanDDetector(BaseDetector):
-    """Direct VLM (llava via local Ollama) for per-frame hazard reasoning,
-    with Grounding DINO supplying the bounding boxes the VLM cannot produce
-    reliably itself (IoU < 20% in the literature). Roughly 1 s per sampled
-    frame — use a high frame skip and short clips."""
+    """Direct VLM for per-frame hazard reasoning, served by the Ollama
+    server on the DGX Spark (config.VLM_MODELS chain, default
+    qwen2.5vl:32b -> gemma3:27b -> llava:7b), with Grounding DINO supplying
+    the bounding boxes the VLM cannot produce reliably itself (IoU < 20% in
+    the literature). Roughly 1 s per sampled frame — use a high frame skip
+    and short clips."""
 
     key = "plan_d"
     label = "Plan D — Direct VLM"
@@ -224,8 +227,8 @@ class PlanDDetector(BaseDetector):
     )
 
     def load(self):
-        import ollama
-        self._ollama = ollama
+        from llm_client import get_client
+        self._llm = get_client()
         self._grounder = _GroundingDINO.get(self.device)
         return self
 
@@ -241,23 +244,23 @@ class PlanDDetector(BaseDetector):
         if not ok:
             return {"workers": 0, "vehicles": 0, "hazard": False,
                     "note": "encode failed", "detections": detections}
-        try:
-            response = self._ollama.chat(
-                model="llava:7b",
-                messages=[{"role": "user", "content": self.PROMPT, "images": [buf.tobytes()]}],
-            )
-            match = re.search(r"\{.*\}", response["message"]["content"], re.DOTALL)
-            parsed = json.loads(match.group(0)) if match else {}
-            return {
-                "workers": int(parsed.get("workers", 0)),
-                "vehicles": int(parsed.get("vehicles", 0)),
-                "hazard": bool(parsed.get("proximity_hazard", False)),
-                "note": "VLM + DINO boxes",
-                "detections": detections,
-            }
-        except Exception:
-            return {"workers": 0, "vehicles": 0, "hazard": False,
-                    "note": "VLM unavailable, DINO boxes only", "detections": detections}
+        text = self._llm.describe_image(self.PROMPT, buf.tobytes())
+        if text:
+            try:
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                parsed = json.loads(match.group(0)) if match else {}
+                model = self._llm.resolve(config.VLM_MODELS) or "VLM"
+                return {
+                    "workers": int(parsed.get("workers", 0)),
+                    "vehicles": int(parsed.get("vehicles", 0)),
+                    "hazard": bool(parsed.get("proximity_hazard", False)),
+                    "note": f"{model} + DINO boxes",
+                    "detections": detections,
+                }
+            except Exception:
+                pass
+        return {"workers": 0, "vehicles": 0, "hazard": False,
+                "note": "VLM unavailable, DINO boxes only", "detections": detections}
 
 
 class PlanEDetector(BaseDetector):
