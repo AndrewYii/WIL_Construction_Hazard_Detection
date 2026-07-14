@@ -74,6 +74,27 @@ detection machine) plays the same pre-synthesized clips; disable with
 For unattended operation use `scripts/run_session.sh` (tmux) and
 `scripts/stop_session.sh`.
 
+## 3b. Site testing: cameras
+
+**Phone as camera (easiest field test).** Install an IP camera app on the
+phone (Android: "IP Webcam"), start its server, note the URL it shows, then
+on the Spark:
+
+```bash
+python app/live.py --weights ... --headless \
+    --source http://<phone-ip>:8080/video
+```
+
+Walk the site with the phone; watch the dashboard (and hear alerts) from any
+browser. Phone and Spark must be on the same network (or both on Tailscale).
+
+**Intel RealSense.** Must be plugged into the detection machine by USB3 —
+depth does not survive ordinary network streaming. Its RGB stream registers
+as a normal webcam, so `--source 0` (or 1) works with no code changes.
+Planned upgrade once mounted: read aligned depth via `pyrealsense2` and
+convert the proximity hazard from pixel distance to true metres — a large
+accuracy gain for the proximity use case.
+
 ## 4. Hazard use cases
 
 | Use case | Trigger | Spoken alert |

@@ -292,7 +292,10 @@ with models_col:
 st.caption("Upload site footage to detect workers, dangerous vehicles, and proximity hazards, "
            "then generate a structured safety report.")
 
-with st.sidebar:
+@st.fragment(run_every="30s")
+def spark_status_panel():
+    """Self-refreshing so a dropped tunnel/network shows up without a manual
+    rerun — matters when testing on site."""
     st.subheader("Spark LLM server")
     status = spark_status()
     if status["up"]:
@@ -306,6 +309,10 @@ with st.sidebar:
         st.error(f"Offline — {status['host']}")
         st.caption("Set OLLAMA_HOST=http://<spark-ip>:11434. "
                    "Reports fall back to the built-in template.")
+
+
+with st.sidebar:
+    spark_status_panel()
     st.divider()
     st.subheader("Live monitoring")
     st.caption("Real-time streaming with voice alerts runs separately:")
@@ -341,8 +348,10 @@ with left:
         st.video(uploaded)
 
         if st.button("Run detection", type="primary", width="stretch"):
-            if not Path(weights_path).exists():
-                st.error(f"Weights not found: {weights_path}")
+            # only Plans A and C need the fine-tuned weights; B/D/E bring their own
+            if approach.startswith(("Plan A", "Plan C")) and not Path(weights_path).exists():
+                st.error(f"Weights not found: {weights_path} — train Plan A first, "
+                         "or pick Plan B / D / E which need no custom weights.")
                 st.stop()
 
             tmp_dir = Path(tempfile.mkdtemp())
@@ -363,21 +372,27 @@ with left:
                                    caption=f"Live preview — frame {idx}",
                                    width="stretch")
 
-            detector = get_detector(approach, weights_path, device)
-
-            with st.spinner("Running inference..."):
-                report = process_video(
-                    video_path=str(input_path),
-                    model_path=weights_path,
-                    output_path=str(output_path),
-                    conf=conf,
-                    imgsz=imgsz,
-                    device=device,
-                    frame_skip=frame_skip,
-                    progress_cb=update,
-                    detector=detector,
-                    preview_cb=preview,
-                )
+            try:
+                detector = get_detector(approach, weights_path, device)
+                with st.spinner("Running inference..."):
+                    report = process_video(
+                        video_path=str(input_path),
+                        model_path=weights_path,
+                        output_path=str(output_path),
+                        conf=conf,
+                        imgsz=imgsz,
+                        device=device,
+                        frame_skip=frame_skip,
+                        progress_cb=update,
+                        detector=detector,
+                        preview_cb=preview,
+                    )
+            except Exception as exc:
+                progress.empty()
+                preview_slot.empty()
+                get_detector.clear()  # a half-loaded model must not stay cached
+                st.error(f"Processing failed: {exc}")
+                st.stop()
             progress.empty()
             preview_slot.empty()
 
