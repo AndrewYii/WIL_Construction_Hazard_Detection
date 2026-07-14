@@ -31,6 +31,14 @@ def get_detector(approach: str, weights_path: str, device: str):
 def spark_status():
     return get_client().status()
 
+
+@st.cache_resource(show_spinner=False)
+def get_alert_engine():
+    """Voice alerts for upload processing: same debounce/cooldown engine as
+    live mode, speaker on the machine running this app, no events log."""
+    from alerts import AlertEngine, AudioPlayer
+    return AlertEngine(events_path=None, player=AudioPlayer())
+
 st.set_page_config(page_title="Construction Hazard Detection", page_icon="🚧", layout="wide")
 
 # --- Visual theme: white base with cyan accents (CSS only, no behavior changes) ---
@@ -340,6 +348,8 @@ with left:
     imgsz, frame_skip = SPEED_PRESETS[speed]
     st.caption(f"{imgsz}px inference, model runs every {frame_skip + 1} frame(s)")
 
+    speak_alerts = st.toggle("Voice alert on the spot when a hazard is found", value=True)
+
     weights_path = str(DEFAULT_WEIGHTS)
     device = "0" if torch.cuda.is_available() else "cpu"
     conf = 0.4
@@ -374,6 +384,12 @@ with left:
 
             try:
                 detector = get_detector(approach, weights_path, device)
+                engine = get_alert_engine() if speak_alerts else None
+
+                def on_hazard(active: bool):
+                    if engine:
+                        engine.update({"proximity"} if active else set())
+
                 with st.spinner("Running inference..."):
                     report = process_video(
                         video_path=str(input_path),
@@ -387,6 +403,7 @@ with left:
                         detector=detector,
                         preview_cb=preview,
                         preview_every=5,
+                        alert_cb=on_hazard,
                     )
             except Exception as exc:
                 progress.empty()

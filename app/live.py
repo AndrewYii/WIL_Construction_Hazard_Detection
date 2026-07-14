@@ -98,12 +98,16 @@ class CaptureThread(threading.Thread):
         self.loop_file = loop_file
         self.stop_flag = threading.Event()
         self.fps_hint = 25.0
+        # SourceManager clears this when hot-swapping cameras so a retiring
+        # thread doesn't shut the shared slot under the new one
+        self.close_on_exit = True
 
     def run(self):
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened():
             print(f"[capture] ERROR: cannot open source {self.source!r}")
-            self.slot.close()
+            if self.close_on_exit:
+                self.slot.close()
             return
         self.fps_hint = cap.get(cv2.CAP_PROP_FPS) or 25.0
         delay = 1.0 / self.fps_hint if self.loop_file else 0.0
@@ -118,7 +122,43 @@ class CaptureThread(threading.Thread):
             if delay:  # pace file playback at native FPS
                 time.sleep(delay)
         cap.release()
-        self.slot.close()
+        if self.close_on_exit:
+            self.slot.close()
+
+
+def parse_source(raw: str):
+    return int(raw) if isinstance(raw, str) and raw.isdigit() else raw
+
+
+class SourceManager:
+    """Hot-swap the camera at runtime (webcam <-> RealSense <-> phone URL)
+    without touching detection or connected dashboard clients."""
+
+    def __init__(self, in_slot: LatestFrame):
+        self.in_slot = in_slot
+        self.capture: CaptureThread | None = None
+        self.current = None
+        self._lock = threading.Lock()
+
+    def start(self, source, loop_file: bool = False, critical: bool = False) -> bool:
+        """critical=True: failure to open ends the session (initial startup).
+        Hot-swaps use critical=False so a missing camera (e.g. RealSense not
+        plugged in yet) just stalls the stream until the user switches back."""
+        with self._lock:
+            if self.capture and self.capture.is_alive():
+                self.capture.close_on_exit = False
+                self.capture.stop_flag.set()
+            cap = CaptureThread(source, self.in_slot, loop_file)
+            cap.close_on_exit = critical
+            cap.start()
+            self.capture = cap
+            self.current = source
+            return True
+
+    def stop(self):
+        with self._lock:
+            if self.capture:
+                self.capture.stop_flag.set()
 
 
 # --------------------------------------------------------------------------
@@ -283,21 +323,39 @@ class IncidentAnalyst(threading.Thread):
 
 
 def spark_status_poller(state: SessionState, interval: float = 30.0):
-    """Background refresh of the Spark Ollama status for the dashboard."""
+    """Background refresh of the Spark Ollama status for the dashboard.
+    Also keeps the report/VLM models warm so alert-time reasoning is fast."""
     from llm_client import get_client
+    client = get_client()
+    warmed = 0.0
     while True:
         try:
-            status = get_client().status()
+            status = client.status()
         except Exception:
             status = {"up": False, "host": config.OLLAMA_HOST, "models": []}
         with state.lock:
             state.spark_status = status
+        if status.get("up") and time.time() - warmed > 600:
+            client.warm()  # re-pin models within their 30m keep_alive window
+            warmed = time.time()
         time.sleep(interval)
 
 
 # --------------------------------------------------------------------------
 # Drawing
 # --------------------------------------------------------------------------
+
+def _draw_subtitle(frame, text):
+    """Broadcast-style caption bar at the bottom of the frame — readable on a
+    phone screen and preserved in any recording of the stream."""
+    h, w = frame.shape[:2]
+    scale = max(0.55, min(w / 1100, 1.0))
+    (tw, th), _ = cv2.getTextSize(text, FONT, scale, 2)
+    x = max((w - tw) // 2, 8)
+    y = h - 18
+    cv2.rectangle(frame, (x - 14, y - th - 12), (x + tw + 14, y + 10), (20, 20, 190), -1)
+    cv2.putText(frame, text, (x, y), FONT, scale, (255, 255, 255), 2)
+
 
 def annotate(frame, detections, hazard_types, hazard_pairs):
     for det in detections:
@@ -319,6 +377,9 @@ def annotate(frame, detections, hazard_types, hazard_pairs):
         cv2.rectangle(frame, (x2 - tw - 20, y - th - 8), (x2, y + 8), ALERT_BG, -1)
         cv2.putText(frame, text, (x2 - tw - 10, y), FONT, 0.75, (255, 255, 255), 2)
         y += th + 24
+    if hazard_types:
+        _draw_subtitle(frame, "WARNING: " + "  +  ".join(
+            HAZARD_LABELS.get(k, k.upper()) for k in hazard_types))
     return frame
 
 
@@ -338,6 +399,7 @@ def detection_loop(args, detector, in_slot: LatestFrame,
                    stop_flag: threading.Event, analyst: IncidentAnalyst | None = None):
     motion = None
     frame_diag = None
+    frame_shape = None
     last_seq = 0
     fps_smooth = None
 
@@ -349,8 +411,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             continue
         t0 = time.time()
 
-        if frame_diag is None:
-            h, w = frame.shape[:2]
+        if frame.shape[:2] != frame_shape:  # first frame, or camera swapped
+            frame_shape = frame.shape[:2]
+            h, w = frame_shape
             frame_diag = math.hypot(w, h)
             motion = VehicleMotionTracker(frame_diag, config.VEHICLE_MOVE_RATIO_PER_SEC)
 
@@ -418,7 +481,8 @@ def detection_loop(args, detector, in_slot: LatestFrame,
 # HTTP server (headless mode)
 # --------------------------------------------------------------------------
 
-def make_handler(out_slot: LatestFrame, state: SessionState):
+def make_handler(out_slot: LatestFrame, state: SessionState,
+                 sources: "SourceManager"):
     dashboard = DASHBOARD_HTML
 
     class Handler(BaseHTTPRequestHandler):
@@ -436,17 +500,34 @@ def make_handler(out_slot: LatestFrame, state: SessionState):
             elif self.path.startswith("/stream"):
                 self._stream()
             elif self.path.startswith("/events"):
-                body = json.dumps(state.snapshot()).encode()
+                snap = state.snapshot()
+                snap["source"] = str(sources.current)
+                body = json.dumps(snap).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/switch"):
+                self._switch()
             elif self.path.startswith("/report"):
                 self._report()
             else:
                 self.send_error(404)
+
+        def _switch(self):
+            from urllib.parse import parse_qs, urlparse
+            raw = (parse_qs(urlparse(self.path).query).get("src") or [""])[0].strip()
+            if raw:
+                sources.start(parse_source(raw))
+                print(f"[live] source switched to: {raw}")
+            body = json.dumps({"ok": bool(raw), "source": str(sources.current)}).encode()
+            self.send_response(200 if raw else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _stream(self):
             self.send_response(200)
@@ -569,6 +650,9 @@ color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-si
 #incidents li{padding:6px 0;border-bottom:1px dashed var(--line)}
 #incidents li b{color:var(--amber)}
 #incidents li span{color:var(--mut)}
+#srcin{flex:1;min-width:170px;background:#0f1a20;border:1px solid var(--line);
+color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
+#srcnow{font-size:11px;color:var(--mut);width:100%}
 </style></head><body>
 <header>
   <span class="tag">Site Safety Monitor</span>
@@ -608,6 +692,14 @@ color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-si
     <ul id="log"><li>No alerts yet.</li></ul>
     <h2>On-the-spot AI analysis</h2>
     <ul id="incidents"><li>Scene notes appear here seconds after an alert fires.</li></ul>
+    <h2>Camera source</h2>
+    <div class="foot" id="srcbar">
+      <button class="srcbtn" data-src="0">Webcam 0</button>
+      <button class="srcbtn" data-src="1">RealSense / Cam 1</button>
+      <input id="srcin" placeholder="phone URL e.g. http://192.168.0.5:8080/video">
+      <button id="srcgo">Switch</button>
+      <span id="srcnow"></span>
+    </div>
     <div class="foot">
       <button class="mute" id="mutebtn">🔊 Voice on</button>
       <button id="reportbtn">Generate report</button>
@@ -669,6 +761,8 @@ async function poll(){
                      +(n.note||'');
         inc.appendChild(li);});
     }
+    if(d.source!==undefined&&!$('srcnow').textContent.startsWith('Switching'))
+      $('srcnow').textContent='Current source: '+d.source;
     if(d.live_report){
       const lr=$('livereport');
       if(lr.textContent!==d.live_report){lr.textContent=d.live_report;}
@@ -680,6 +774,14 @@ async function poll(){
       :'Spark LLM: offline ('+s.host+') — reports use template fallback';
   }catch(e){$('livedot').classList.remove('ok');}
 }
+async function switchSrc(v){
+  if(!v)return;
+  $('srcnow').textContent='Switching to '+v+' …';
+  try{const r=await fetch('/switch?src='+encodeURIComponent(v));const d=await r.json();
+    $('srcnow').textContent='Current source: '+d.source;}
+  catch(e){$('srcnow').textContent='Switch failed: '+e;}}
+document.querySelectorAll('.srcbtn').forEach(b=>b.onclick=()=>switchSrc(b.dataset.src));
+$('srcgo').onclick=()=>switchSrc($('srcin').value.trim());
 $('reportbtn').onclick=async()=>{
   const box=$('report');box.style.display='block';
   box.textContent='Generating safety report on the Spark…';
@@ -735,11 +837,10 @@ def main():
     state = SessionState(engine)
     state.detector_label = getattr(detector, "label", "Plan A — Fine-tuned YOLOv8")
 
-    source = args.video if args.video else (
-        int(args.source) if args.source.isdigit() else args.source)
+    source = args.video if args.video else parse_source(args.source)
     in_slot, out_slot = LatestFrame(), LatestFrame()
-    capture = CaptureThread(source, in_slot, loop_file=bool(args.video))
-    capture.start()
+    sources = SourceManager(in_slot)
+    sources.start(source, loop_file=bool(args.video), critical=True)
 
     threading.Thread(target=spark_status_poller, args=(state,), daemon=True).start()
 
@@ -759,7 +860,7 @@ def main():
     try:
         if args.headless:
             server = ThreadingHTTPServer(("0.0.0.0", args.port),
-                                         make_handler(out_slot, state))
+                                         make_handler(out_slot, state, sources))
             print(f"[live] dashboard:  http://{local_ip()}:{args.port}")
             print(f"[live] MJPEG feed: http://{local_ip()}:{args.port}/stream.mjpg")
             print("[live] Ctrl+C to stop")
@@ -780,7 +881,7 @@ def main():
         pass
     finally:
         stop_flag.set()
-        capture.stop_flag.set()
+        sources.stop()
         if server:
             server.shutdown()
         print(f"\n[live] session summary: {json.dumps(state.snapshot()['alert_counts'])}")

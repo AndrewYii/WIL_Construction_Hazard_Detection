@@ -44,10 +44,22 @@ def _draw_boxes(frame, detections):
         cv2.putText(frame, label, (x1, max(y1 - 6, 12)), FONT, 0.5, color, 2)
 
 
+def _draw_subtitle(frame, text):
+    """Caption bar at the bottom of the frame, mirrored from live.py."""
+    h, w = frame.shape[:2]
+    scale = max(0.55, min(w / 1100, 1.0))
+    (tw, th), _ = cv2.getTextSize(text, FONT, scale, 2)
+    x = max((w - tw) // 2, 8)
+    y = h - 18
+    cv2.rectangle(frame, (x - 14, y - th - 12), (x + tw + 14, y + 10), (20, 20, 190), -1)
+    cv2.putText(frame, text, (x, y), FONT, scale, (255, 255, 255), 2)
+
+
 def _draw_frame(frame, detections, hazards):
     _draw_boxes(frame, detections)
     if hazards:
         _draw_alert(frame, f"! POSSIBLE ACCIDENT x{len(hazards)}")
+        _draw_subtitle(frame, "WARNING: WORKER TOO CLOSE TO VEHICLE")
     return frame
 
 
@@ -101,6 +113,7 @@ def process_video(
     detector=None,
     preview_cb=None,
     preview_every: int = 10,
+    alert_cb=None,
 ):
     """
     Run detection over a video, write an annotated copy, and return a report dict.
@@ -159,6 +172,8 @@ def process_video(
                     "timestamp_sec": round(frame_idx / fps, 2),
                     "pairs": len(hazards),
                 })
+            if alert_cb and run_model:
+                alert_cb(bool(hazards))
             annotated = _draw_frame(frame, last_detections, hazards)
         else:
             if run_model:
@@ -173,6 +188,8 @@ def process_video(
                         "timestamp_sec": round(frame_idx / fps, 2),
                         "pairs": 1,
                     })
+                if alert_cb:
+                    alert_cb(bool(last_summary["hazard"]))
             annotated = _draw_summary(frame, last_summary)
 
         writer.write(annotated)

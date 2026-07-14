@@ -83,15 +83,20 @@ class SparkLLM:
         }
 
     def chat(self, chain: list[str], messages: list[dict], retries: int = 1,
-             need: str | None = None) -> str | None:
+             need: str | None = None, num_predict: int | None = None) -> str | None:
         """Chat against the first available model in the chain.
+        keep_alive pins the model in the server's memory so repeat calls skip
+        the multi-GB reload; num_predict caps output length for speed.
         Returns the reply text, or None if every attempt failed."""
         model = self.resolve(chain, need=need)
         candidates = [model] if model else list(chain)
+        options = {"num_predict": num_predict} if num_predict else None
         for candidate in candidates:
             for _ in range(retries + 1):
                 try:
-                    response = self._get_client().chat(model=candidate, messages=messages)
+                    response = self._get_client().chat(
+                        model=candidate, messages=messages,
+                        options=options, keep_alive="30m")
                     text = response["message"]["content"].strip()
                     if text:
                         return text
@@ -99,14 +104,27 @@ class SparkLLM:
                     continue
         return None
 
+    def warm(self):
+        """Preload the report + VLM models on the server (empty generate) so
+        the first real request doesn't pay the multi-GB model load. Cheap to
+        call repeatedly; runs in the caller's thread — use a background one."""
+        for chain, need in ((config.REPORT_MODELS, None), (config.VLM_MODELS, "vision")):
+            model = self.resolve(chain, need=need)
+            if model:
+                try:
+                    self._get_client().generate(model=model, prompt="", keep_alive="30m")
+                except Exception:
+                    pass
+
     def generate_report(self, prompt: str) -> str | None:
-        return self.chat(config.REPORT_MODELS, [{"role": "user", "content": prompt}])
+        return self.chat(config.REPORT_MODELS, [{"role": "user", "content": prompt}],
+                         num_predict=900)
 
     def describe_image(self, prompt: str, jpeg_bytes: bytes) -> str | None:
         return self.chat(
             config.VLM_MODELS,
             [{"role": "user", "content": prompt, "images": [jpeg_bytes]}],
-            need="vision",
+            need="vision", num_predict=220,
         )
 
 
