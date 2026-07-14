@@ -386,6 +386,7 @@ with left:
                         progress_cb=update,
                         detector=detector,
                         preview_cb=preview,
+                        preview_every=5,
                     )
             except Exception as exc:
                 progress.empty()
