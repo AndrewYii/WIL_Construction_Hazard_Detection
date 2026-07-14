@@ -50,6 +50,31 @@ Optional overrides (defaults in `app/config.py`): `REPORT_MODELS`,
 Check connectivity: `python app/llm_client.py` prints the server status and
 which models the chains resolved to.
 
+## 2b. Everything on the Spark (single-server mode)
+
+The whole stack runs on the Spark itself; phones/laptops only need a browser.
+
+```bash
+git clone <repo> && cd WIL_Construction_Hazard_Detection
+git checkout Spark
+python3 -m venv venv && source venv/bin/activate
+pip install -r app/requirements.txt
+
+# the Spark is ARM64 (GB10) — install the CUDA build of torch explicitly:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+python -c "import torch; print(torch.cuda.is_available())"   # must print True
+
+sudo apt install espeak-ng    # voice clips for server-side audio
+```
+
+Then:
+- live monitor + dashboard: `scripts/run_session.sh` → phone opens
+  `http://<spark-ip>:8090` (tap the voice button once — mobile browsers
+  need one tap before they allow speech)
+- upload app (optional): `streamlit run app/app.py --server.address 0.0.0.0`
+  → `http://<spark-ip>:8501`
+- `OLLAMA_HOST` can stay default on the Spark itself (localhost:11434)
+
 ## 3. Real-time monitor
 
 ```bash
