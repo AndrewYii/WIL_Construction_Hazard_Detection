@@ -15,6 +15,7 @@ class Detection:
     cls: int
     conf: float
     xyxy: tuple  # x1, y1, x2, y2 in pixel coords
+    flags: tuple = ()  # optional extra tags, e.g. ("FALLEN?",) from the pose overlay
 
 
 WORKER = 0

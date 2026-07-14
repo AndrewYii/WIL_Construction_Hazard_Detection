@@ -1,0 +1,8 @@
+streamlit
+opencv-python-headless
+ultralytics
+ollama
+transformers
+scikit-learn
+imageio-ffmpeg
+fpdf2

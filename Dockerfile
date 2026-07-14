@@ -7,13 +7,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY app/requirements.txt .
 RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio \
     && pip3 install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY runs/detect/plan_a_yolov8/weights/best.pt ./runs/detect/plan_a_yolov8/weights/best.pt
 
+# Phase 2 report generation calls a local Ollama server (not bundled here).
+# If unreachable, report_generation.py falls back to a template report automatically.
 EXPOSE 8501
 
 CMD ["streamlit", "run", "app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

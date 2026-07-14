@@ -19,4 +19,6 @@ build/
 *.zip
 *.rar
 *.tar.gz
-smoke_test_out*.mp4
+*.mp4
+*.docx
+
