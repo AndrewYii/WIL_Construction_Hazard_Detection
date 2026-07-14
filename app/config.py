@@ -38,7 +38,8 @@ REPORT_MODELS = [
 ]
 VLM_MODELS = [
     m.strip() for m in os.environ.get(
-        "VLM_MODELS", "gemma4:26b,qwen2.5vl:32b,gemma3:27b,llava:7b"
+        "VLM_MODELS",
+        "gemma4:26b,qwen3.6:35b-a3b-bf16,qwen2.5vl:32b,gemma3:27b,llava:7b"
     ).split(",") if m.strip()
 ]
 

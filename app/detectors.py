@@ -249,7 +249,7 @@ class PlanDDetector(BaseDetector):
             try:
                 match = re.search(r"\{.*\}", text, re.DOTALL)
                 parsed = json.loads(match.group(0)) if match else {}
-                model = self._llm.resolve(config.VLM_MODELS) or "VLM"
+                model = self._llm.resolve(config.VLM_MODELS, need="vision") or "VLM"
                 return {
                     "workers": int(parsed.get("workers", 0)),
                     "vehicles": int(parsed.get("vehicles", 0)),

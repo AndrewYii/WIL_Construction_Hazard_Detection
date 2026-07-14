@@ -22,6 +22,7 @@ class SparkLLM:
         self.timeout = timeout or config.OLLAMA_TIMEOUT_SEC
         self._client = None
         self._models_cache: tuple[float, list[str]] | None = None
+        self._caps: dict[str, set[str]] = {}
 
     def _get_client(self):
         if self._client is None:
@@ -30,14 +31,24 @@ class SparkLLM:
         return self._client
 
     def available_models(self, cache_sec: float = 10.0) -> list[str]:
-        """Model names pulled on the server. Empty list if unreachable."""
+        """Model names pulled on the server. Empty list if unreachable.
+        Also refreshes self._caps ({model: set(capabilities)}) from /api/tags
+        so vision-capable models can be told apart."""
         now = time.time()
         if self._models_cache and now - self._models_cache[0] < cache_sec:
             return self._models_cache[1]
+        models = []
         try:
-            data = self._get_client().list()
-            models = [m.get("model") or m.get("name", "") for m in data.get("models", [])]
-            models = [m for m in models if m]
+            import json as _json
+            import urllib.request
+            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=5) as r:
+                data = _json.load(r)
+            for m in data.get("models", []):
+                name = m.get("model") or m.get("name", "")
+                if name:
+                    models.append(name)
+                    if "capabilities" in m:
+                        self._caps[name] = set(m["capabilities"])
         except Exception:
             models = []
         self._models_cache = (now, models)
@@ -46,13 +57,17 @@ class SparkLLM:
     def is_up(self) -> bool:
         return bool(self.available_models())
 
-    def resolve(self, chain: list[str]) -> str | None:
+    def resolve(self, chain: list[str], need: str | None = None) -> str | None:
         """First model from the preference chain present on the server.
-        Matches with or without an explicit tag (qwen3:32b == qwen3:32b-*)."""
+        Matches with or without an explicit tag (qwen3:32b == qwen3:32b-*).
+        `need` filters on a server-reported capability (e.g. "vision") —
+        models whose capability list is known and lacks it are skipped."""
         available = self.available_models()
         for want in chain:
             for have in available:
                 if have == want or have.startswith(want + "-") or have.split(":")[0] == want:
+                    if need and have in self._caps and need not in self._caps[have]:
+                        break  # this chain entry can't do the job; try next
                     return have
         return None
 
@@ -64,13 +79,14 @@ class SparkLLM:
             "up": bool(models),
             "models": models,
             "report_model": self.resolve(config.REPORT_MODELS),
-            "vlm_model": self.resolve(config.VLM_MODELS),
+            "vlm_model": self.resolve(config.VLM_MODELS, need="vision"),
         }
 
-    def chat(self, chain: list[str], messages: list[dict], retries: int = 1) -> str | None:
+    def chat(self, chain: list[str], messages: list[dict], retries: int = 1,
+             need: str | None = None) -> str | None:
         """Chat against the first available model in the chain.
         Returns the reply text, or None if every attempt failed."""
-        model = self.resolve(chain)
+        model = self.resolve(chain, need=need)
         candidates = [model] if model else list(chain)
         for candidate in candidates:
             for _ in range(retries + 1):
@@ -90,6 +106,7 @@ class SparkLLM:
         return self.chat(
             config.VLM_MODELS,
             [{"role": "user", "content": prompt, "images": [jpeg_bytes]}],
+            need="vision",
         )
 
 

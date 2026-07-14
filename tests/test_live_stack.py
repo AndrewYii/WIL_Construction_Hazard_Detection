@@ -156,6 +156,26 @@ def test_resolve_none_when_server_empty(monkeypatch):
     assert not client.is_up()
 
 
+def test_resolve_vision_skips_text_only_models(monkeypatch):
+    # mirrors the real Spark: gemma4 pulled but its build reports no vision
+    client = SparkLLM(host="http://test:11434")
+    monkeypatch.setattr(client, "available_models",
+                        lambda cache_sec=0: ["gemma4:26b", "qwen2.5vl:32b"])
+    client._caps = {"gemma4:26b": {"completion", "tools", "thinking"},
+                    "qwen2.5vl:32b": {"completion", "vision"}}
+    chain = ["gemma4:26b", "qwen2.5vl:32b"]
+    assert client.resolve(chain) == "gemma4:26b"                # text use: fine
+    assert client.resolve(chain, need="vision") == "qwen2.5vl:32b"
+
+
+def test_resolve_unknown_capabilities_not_filtered(monkeypatch):
+    # older Ollama servers omit capabilities — never filter on missing info
+    client = SparkLLM(host="http://test:11434")
+    monkeypatch.setattr(client, "available_models",
+                        lambda cache_sec=0: ["gemma4:26b"])
+    assert client.resolve(["gemma4:26b"], need="vision") == "gemma4:26b"
+
+
 # --------------------------------------------------------------------------
 # Report generation fallback
 # --------------------------------------------------------------------------
