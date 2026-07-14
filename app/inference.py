@@ -99,6 +99,8 @@ def process_video(
     progress_cb=None,
     model: YOLO | None = None,
     detector=None,
+    preview_cb=None,
+    preview_every: int = 10,
 ):
     """
     Run detection over a video, write an annotated copy, and return a report dict.
@@ -174,6 +176,9 @@ def process_video(
             annotated = _draw_summary(frame, last_summary)
 
         writer.write(annotated)
+
+        if preview_cb and frame_idx % preview_every == 0:
+            preview_cb(annotated, frame_idx)
 
         frame_idx += 1
         if progress_cb and total_frames:

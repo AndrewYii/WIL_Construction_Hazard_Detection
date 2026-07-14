@@ -13,7 +13,6 @@ from pathlib import Path
 import streamlit as st
 import torch
 
-import config
 from detectors import DETECTOR_REGISTRY, create_detector
 from inference import process_video
 from llm_client import get_client
@@ -272,7 +271,24 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.title("Construction Hazard Detection")
+title_col, models_col = st.columns([4, 1], vertical_alignment="center")
+with title_col:
+    st.title("Construction Hazard Detection")
+with models_col:
+    with st.popover(":material/memory: Models", width="stretch"):
+        if torch.cuda.is_available():
+            st.markdown(f"**Detector device:** GPU — {torch.cuda.get_device_name(0)}")
+        else:
+            st.markdown("**Detector device:** :red[CPU] — no CUDA torch installed, "
+                        "processing will be slow")
+        status = spark_status()
+        if status["up"]:
+            st.markdown(f"**Spark server:** :green[connected] — `{status['host']}`")
+            st.markdown(f"**Report model:** `{status['report_model'] or '—'}`")
+            st.markdown(f"**VLM (Plan D):** `{status['vlm_model'] or '—'}`")
+        else:
+            st.markdown(f"**Spark server:** :red[offline] — `{status['host']}` "
+                        "(reports use template fallback)")
 st.caption("Upload site footage to detect workers, dangerous vehicles, and proximity hazards, "
            "then generate a structured safety report.")
 
@@ -307,16 +323,24 @@ with left:
     if approach.startswith("Plan D"):
         st.caption("Plan D runs about one frame per second. Use a short clip.")
 
+    # imgsz / frame_skip tradeoff; default to Fast on CPU where every frame hurts
+    SPEED_PRESETS = {"Fast": (384, 4), "Balanced": (480, 2), "Accurate": (640, 0)}
+    speed = st.segmented_control(
+        "Processing speed",
+        options=list(SPEED_PRESETS),
+        default="Balanced" if torch.cuda.is_available() else "Fast",
+    ) or "Balanced"
+    imgsz, frame_skip = SPEED_PRESETS[speed]
+    st.caption(f"{imgsz}px inference, model runs every {frame_skip + 1} frame(s)")
+
     weights_path = str(DEFAULT_WEIGHTS)
     device = "0" if torch.cuda.is_available() else "cpu"
     conf = 0.4
-    imgsz = 480
-    frame_skip = 2
 
     if uploaded is not None:
         st.video(uploaded)
 
-        if st.button("Run detection", type="primary", use_container_width=True):
+        if st.button("Run detection", type="primary", width="stretch"):
             if not Path(weights_path).exists():
                 st.error(f"Weights not found: {weights_path}")
                 st.stop()
@@ -331,6 +355,14 @@ with left:
             def update(pct):
                 progress.progress(min(pct, 1.0), text=f"Processing... {pct*100:.0f}%")
 
+            # live annotated preview lands in the Output column while we work
+            preview_slot = right.empty()
+
+            def preview(frame_bgr, idx):
+                preview_slot.image(frame_bgr[:, :, ::-1],
+                                   caption=f"Live preview — frame {idx}",
+                                   width="stretch")
+
             detector = get_detector(approach, weights_path, device)
 
             with st.spinner("Running inference..."):
@@ -344,8 +376,10 @@ with left:
                     frame_skip=frame_skip,
                     progress_cb=update,
                     detector=detector,
+                    preview_cb=preview,
                 )
             progress.empty()
+            preview_slot.empty()
 
             with st.spinner("Generating safety report..."):
                 safety_report = generate_hazard_report(report)
@@ -395,21 +429,21 @@ with right:
                 data=report_to_pdf(safety_report),
                 file_name="site_safety_report.pdf",
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",
             )
             d2.download_button(
                 "Safety report (TXT)",
                 data=safety_report,
                 file_name="site_safety_report.txt",
                 mime="text/plain",
-                use_container_width=True,
+                width="stretch",
             )
             d3.download_button(
                 "Detection data (JSON)",
                 data=json.dumps(report, indent=2),
                 file_name="hazard_report.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
 
 runs = st.session_state.get("runs", {})
@@ -419,6 +453,6 @@ if len(runs) > 1:
                "the detection approach in the sidebar to add rows.")
     st.dataframe(
         [{"approach": k, **v} for k, v in runs.items()],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
