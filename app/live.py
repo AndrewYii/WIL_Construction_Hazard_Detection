@@ -24,6 +24,7 @@ OLLAMA_HOST=http://<spark-ip>:11434 (see docs/SPARK_SETUP.md).
 import argparse
 import json
 import math
+import queue
 import random
 import socket
 import threading
@@ -178,6 +179,8 @@ class SessionState:
         self.proximity_events: list[dict] = []
         self.detector_label = ""
         self.spark_status: dict = {"up": False, "host": config.OLLAMA_HOST, "models": []}
+        self.incidents: list[dict] = []   # VLM scene notes per fired alert
+        self.live_report: str = ""        # auto-refreshed LLM report
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -194,6 +197,8 @@ class SessionState:
                 "detector": self.detector_label,
                 "spark": self.spark_status,
                 "hazard_labels": HAZARD_LABELS,
+                "incidents": self.incidents[-8:],
+                "live_report": self.live_report,
             }
 
     def to_report_dict(self) -> dict:
@@ -209,7 +214,72 @@ class SessionState:
                 "peak": dict(self.peak),
                 "proximity_hazard_events": list(self.proximity_events),
                 "total_hazard_events": len(self.proximity_events),
+                "incident_notes": self.incidents[-12:],
             }
+
+
+class IncidentAnalyst(threading.Thread):
+    """On-the-spot reasoning path. The instant voice alert has already fired
+    (milliseconds); this thread takes the flagged snapshot to the Spark:
+      1. VLM describes the scene (who is at risk, which machinery, layout)
+      2. the LLM rewrites the live safety report with those notes,
+         throttled to one rewrite per REPORT_REFRESH_SEC
+    Bounded queue, drops snapshots under backlog — detection never waits."""
+
+    VLM_PROMPT = (
+        "A {kind} hazard alert just fired on this construction site camera "
+        "({message}). In 2-3 short factual sentences, describe the scene: "
+        "who is at risk, what machinery is involved, and their spatial "
+        "arrangement. No preamble, no speculation beyond the image."
+    )
+
+    def __init__(self, state: SessionState,
+                 report_refresh_sec: float = config.REPORT_REFRESH_SEC):
+        super().__init__(daemon=True)
+        self.state = state
+        self.report_refresh_sec = report_refresh_sec
+        self._jobs: queue.Queue = queue.Queue(maxsize=4)
+        self._last_report = 0.0
+
+    def submit(self, event: dict, frame):
+        try:
+            self._jobs.put_nowait((event, frame))
+        except queue.Full:
+            pass  # analysis is best-effort; the alert itself already fired
+
+    def run(self):
+        from llm_client import get_client
+        from report_generation import generate_hazard_report
+        client = get_client()
+        while True:
+            event, frame = self._jobs.get()
+            note = None
+            try:
+                ok, jpg = cv2.imencode(".jpg", frame,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ok and client.is_up():
+                    prompt = self.VLM_PROMPT.format(
+                        kind=event.get("type", "safety"),
+                        message=event.get("message", ""))
+                    note = client.describe_image(prompt, jpg.tobytes())
+            except Exception:
+                note = None
+            with self.state.lock:
+                self.state.incidents.append({
+                    "iso": event.get("iso", ""),
+                    "type": event.get("type", ""),
+                    "note": (note or "").strip()[:500] or "scene review unavailable",
+                })
+                del self.state.incidents[:-50]
+            now = time.time()
+            if now - self._last_report >= self.report_refresh_sec:
+                self._last_report = now
+                try:
+                    text = generate_hazard_report(self.state.to_report_dict())
+                    with self.state.lock:
+                        self.state.live_report = text
+                except Exception:
+                    pass
 
 
 def spark_status_poller(state: SessionState, interval: float = 30.0):
@@ -265,7 +335,7 @@ def draw_hud(frame, state: SessionState):
 
 def detection_loop(args, detector, in_slot: LatestFrame,
                    out_slot: LatestFrame, state: SessionState, engine: AlertEngine,
-                   stop_flag: threading.Event):
+                   stop_flag: threading.Event, analyst: IncidentAnalyst | None = None):
     motion = None
     frame_diag = None
     last_seq = 0
@@ -303,9 +373,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         if elevated:
             active.add("height")
 
-        engine.update(active, detail={"frame": state.frames,
-                                      "workers": len(workers),
-                                      "pairs": len(hazard_pairs)})
+        fired = engine.update(active, detail={"frame": state.frames,
+                                              "workers": len(workers),
+                                              "pairs": len(hazard_pairs)})
 
         # --- bookkeeping ----------------------------------------------------
         n_workers = len(workers)
@@ -334,6 +404,12 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         annotated = annotate(frame, detections, sorted(active), hazard_pairs)
         annotated = draw_hud(annotated, state)
         out_slot.put(annotated)
+
+        # on-the-spot reasoning: hand each fired alert's snapshot to the
+        # VLM/LLM worker; copy because this loop keeps drawing on frames
+        if analyst and fired:
+            for event in fired:
+                analyst.submit(event, annotated.copy())
 
     out_slot.close()
 
@@ -485,8 +561,14 @@ letter-spacing:.1em;text-transform:uppercase}
 button:hover{background:rgba(34,184,207,.12)}
 button.mute.off{border-color:var(--mut);color:var(--mut)}
 #spark{font-size:11px;color:var(--mut)}
-#report{white-space:pre-wrap;font:12px/1.5 Consolas,monospace;padding:12px;display:none;
-max-height:340px;overflow-y:auto;border-top:1px solid var(--line)}
+#report,#livereport{white-space:pre-wrap;font:12px/1.5 Consolas,monospace;padding:12px;
+display:none;max-height:340px;overflow-y:auto;border-top:1px solid var(--line)}
+#livereport::before{content:"LIVE SAFETY REPORT (auto-updated on alerts)";display:block;
+color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-size:11px}
+#incidents{list-style:none;max-height:200px;overflow-y:auto;padding:6px 12px;font-size:12px}
+#incidents li{padding:6px 0;border-bottom:1px dashed var(--line)}
+#incidents li b{color:var(--amber)}
+#incidents li span{color:var(--mut)}
 </style></head><body>
 <header>
   <span class="tag">Site Safety Monitor</span>
@@ -524,11 +606,14 @@ max-height:340px;overflow-y:auto;border-top:1px solid var(--line)}
     </div>
     <h2>Alert log</h2>
     <ul id="log"><li>No alerts yet.</li></ul>
+    <h2>On-the-spot AI analysis</h2>
+    <ul id="incidents"><li>Scene notes appear here seconds after an alert fires.</li></ul>
     <div class="foot">
       <button class="mute" id="mutebtn">🔊 Voice on</button>
       <button id="reportbtn">Generate report</button>
       <span id="spark">Spark: checking…</span>
     </div>
+    <div id="livereport"></div>
     <div id="report"></div>
   </section>
 </main>
@@ -576,6 +661,19 @@ async function poll(){
         lastAlert=newest.time;}
       else if(lastAlert===0)lastAlert=newest.time;
     }
+    if(d.incidents&&d.incidents.length){
+      const inc=$('incidents');inc.innerHTML='';
+      [...d.incidents].reverse().forEach(n=>{
+        const li=document.createElement('li');
+        li.innerHTML='<b>'+(n.type||'').toUpperCase()+'</b> <span>'+n.iso+'</span><br>'
+                     +(n.note||'');
+        inc.appendChild(li);});
+    }
+    if(d.live_report){
+      const lr=$('livereport');
+      if(lr.textContent!==d.live_report){lr.textContent=d.live_report;}
+      lr.style.display='block';
+    }
     const s=d.spark;
     $('spark').textContent=s.up
       ?'Spark LLM: '+(s.report_model||'connected')+' @ '+s.host
@@ -615,6 +713,8 @@ def parse_args():
     p.add_argument("--device", default="0", help="CUDA device or 'cpu'")
     p.add_argument("--no-audio", action="store_true",
                    help="Disable server-side speaker output")
+    p.add_argument("--no-analysis", action="store_true",
+                   help="Disable on-the-spot VLM/LLM incident analysis")
     p.add_argument("--height-zone", action="store_true",
                    default=config.HEIGHT_ZONE_ENABLED,
                    help="Enable experimental height-hazard heuristic")
@@ -643,10 +743,15 @@ def main():
 
     threading.Thread(target=spark_status_poller, args=(state,), daemon=True).start()
 
+    analyst = None
+    if not args.no_analysis:
+        analyst = IncidentAnalyst(state)
+        analyst.start()
+
     stop_flag = threading.Event()
     det_thread = threading.Thread(
         target=detection_loop,
-        args=(args, detector, in_slot, out_slot, state, engine, stop_flag),
+        args=(args, detector, in_slot, out_slot, state, engine, stop_flag, analyst),
         daemon=True)
     det_thread.start()
 

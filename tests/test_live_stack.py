@@ -199,6 +199,20 @@ def test_report_falls_back_to_template_when_server_down(monkeypatch):
     assert "PDPA" in text
 
 
+def test_prompt_includes_vlm_incident_notes():
+    from report_generation import _build_prompt
+    report = dict(SAMPLE_REPORT)
+    report["incident_notes"] = [
+        {"iso": "2026-07-14 15:00:01", "type": "proximity",
+         "note": "A worker in a green vest stands beside a reversing excavator."},
+    ]
+    prompt = _build_prompt(report)
+    assert "EYEWITNESS SCENE NOTES" in prompt
+    assert "reversing excavator" in prompt
+    # without notes the section is absent
+    assert "EYEWITNESS SCENE NOTES" not in _build_prompt(SAMPLE_REPORT)
+
+
 def test_report_uses_llm_text_when_valid(monkeypatch):
     import llm_client
     llm_text = "<think>reasoning...</think>## Site Safety Report\n\nAll clear."

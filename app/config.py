@@ -64,6 +64,8 @@ HEIGHT_ZONE_FRACTION = float(os.environ.get("HEIGHT_ZONE_FRACTION", "0.45"))
 # of the same alert so the voice does not spam the site.
 ALERT_TRIGGER_FRAMES = int(os.environ.get("ALERT_TRIGGER_FRAMES", "3"))
 ALERT_COOLDOWN_SEC = float(os.environ.get("ALERT_COOLDOWN_SEC", "6"))
+# On-the-spot AI analysis: min seconds between automatic live-report rewrites
+REPORT_REFRESH_SEC = float(os.environ.get("REPORT_REFRESH_SEC", "45"))
 AUDIO_DIR = PROJECT_ROOT / "assets" / "audio"
 EVENTS_LOG = PROJECT_ROOT / "logs" / "events.jsonl"
 

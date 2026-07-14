@@ -67,6 +67,21 @@ def _format_events(report: dict, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _format_incident_notes(report: dict) -> str:
+    """Scene descriptions produced by the VLM at the moment each alert fired
+    (live monitoring only). Injected as eyewitness-style notes so the report
+    can describe the actual machinery and spatial situation, not just times."""
+    notes = report.get("incident_notes") or []
+    if not notes:
+        return ""
+    lines = [f"- [{n.get('iso', '')}] {n.get('type', 'hazard')}: {n.get('note', '')}"
+             for n in notes if n.get("note")]
+    if not lines:
+        return ""
+    return ("\nEYEWITNESS SCENE NOTES from the flagged moments "
+            "(use these details in sections 1 and 2):\n" + "\n".join(lines) + "\n")
+
+
 def _build_prompt(report: dict) -> str:
     return f"""You are a certified construction site safety officer writing a formal site safety report about footage reviewed from a construction site. Write about the SITE and the WORKERS — what happened, where the danger was, when. Do NOT mention AI, models, detection systems, algorithms, video analysis software, or how the footage was processed. Be direct and specific. No filler, no hedging.
 
@@ -78,7 +93,7 @@ SITE OBSERVATIONS (authoritative — use these facts):
 
 UNSAFE PROXIMITY LOG (worker too close to operating heavy machinery):
 {_format_events(report)}
-
+{_format_incident_notes(report)}
 SAFETY REFERENCES (cite these where relevant):
 {SAFETY_REFERENCES}
 
