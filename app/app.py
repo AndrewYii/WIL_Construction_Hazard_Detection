@@ -13,6 +13,7 @@ from pathlib import Path
 import streamlit as st
 import torch
 
+import config
 from detectors import DETECTOR_REGISTRY, create_detector
 from inference import process_video
 from llm_client import get_client
@@ -38,6 +39,82 @@ def get_alert_engine():
     live mode, speaker on the machine running this app, no events log."""
     from alerts import AlertEngine, AudioPlayer
     return AlertEngine(events_path=None, player=AudioPlayer())
+
+
+def _live_running(port: int) -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/events", timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def _render_realtime(right):
+    """Real-time camera mode: start/attach to the live monitor (app/live.py),
+    pick the camera, and embed its stream in the Output column."""
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from urllib.parse import quote, urlparse
+
+    port = config.DASHBOARD_PORT
+    st.caption("Continuous camera monitoring with on-the-spot voice alerts, "
+               "subtitles, and AI incident analysis.")
+    cam = st.segmented_control(
+        "Camera", ["Webcam 0", "Camera 1 / RealSense", "Phone / IP camera"],
+        default="Webcam 0") or "Webcam 0"
+    if cam == "Phone / IP camera":
+        src = st.text_input("Stream URL",
+                            placeholder="http://192.168.0.5:8080/video").strip()
+    else:
+        src = "0" if cam.startswith("Webcam") else "1"
+
+    running = _live_running(port)
+    if not running:
+        if st.button("Start real-time monitor", type="primary",
+                     width="stretch", disabled=not src):
+            subprocess.Popen(
+                [sys.executable, str(PROJECT_ROOT / "app" / "live.py"),
+                 "--headless", "--port", str(port), "--source", src],
+                cwd=str(PROJECT_ROOT))
+            with st.spinner("Starting detector..."):
+                for _ in range(20):
+                    if _live_running(port):
+                        break
+                    time.sleep(1)
+            if _live_running(port):
+                st.rerun()
+            st.error("Monitor did not start — check the terminal running "
+                     "Streamlit for the error (missing weights or camera).")
+    else:
+        st.success(f"Real-time monitor is running on port {port}.")
+        if st.button("Switch to this camera", width="stretch", disabled=not src):
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/switch?src={quote(src, safe='')}",
+                    timeout=3)
+                st.toast(f"Switched to {cam}")
+            except Exception as exc:
+                st.error(f"Switch failed: {exc}")
+
+    try:
+        host = urlparse(st.context.url).hostname or "localhost"
+    except Exception:
+        host = "localhost"
+    right.subheader("Output")
+    if running:
+        right.markdown(
+            f'<img src="http://{host}:{port}/stream.mjpg" '
+            f'style="width:100%;border:1px solid {BORDER};border-radius:2px;">',
+            unsafe_allow_html=True)
+        right.link_button("Open full dashboard — voice alerts + AI analysis",
+                          f"http://{host}:{port}", width="stretch")
+        right.caption("The dashboard adds browser voice alerts, hazard counters, "
+                      "the alert log, camera switching, and the live LLM report.")
+    else:
+        right.info("Start the monitor to see the live stream here.")
 
 st.set_page_config(page_title="Construction Hazard Detection", page_icon="🚧", layout="wide")
 
@@ -332,6 +409,13 @@ left, right = st.columns([1, 1], gap="large")
 
 with left:
     st.subheader("Input")
+    mode = st.segmented_control(
+        "Input mode", ["Upload video", "Real-time camera"],
+        default="Upload video") or "Upload video"
+    if mode == "Real-time camera":
+        _render_realtime(right)
+        st.stop()
+
     uploaded = st.file_uploader("Upload a video", type=["mp4", "avi", "mov", "mkv"])
 
     approach = st.selectbox("Detection approach", options=list(DETECTOR_REGISTRY.keys()))
