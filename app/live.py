@@ -964,6 +964,8 @@ cursor:pointer}
       <button id="reportbtn">Generate report</button>
       <label id="autolbl"><input type="checkbox" id="autooff" checked>
         auto-off camera when everyone closes</label>
+      <label id="autolbl"><input type="checkbox" id="detailvoice" checked>
+        speak AI scene details after alarms</label>
       <span id="spark">Spark: checking…</span>
     </div>
     <div id="livereport"></div>
@@ -971,17 +973,18 @@ cursor:pointer}
   </section>
 </main>
 <script>
-let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[];
+let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[],lastIncKey=null;
 const $=id=>document.getElementById(id);
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').textContent=muted?'🔇':'🔊';
   $('mutebtn').classList.toggle('off',muted);
   if(!muted)say('Voice alerts enabled');};
-function say(text){
+function say(text,queue){
   if(muted||!window.speechSynthesis)return;
   const u=new SpeechSynthesisUtterance(text);
   u.rate=1.05;u.pitch=1;u.volume=1;
-  speechSynthesis.cancel();speechSynthesis.speak(u);}
+  if(!queue)speechSynthesis.cancel(); // alarms preempt; details wait their turn
+  speechSynthesis.speak(u);}
 function fmtUp(s){return s>=3600?(s/3600).toFixed(1)+'h':s>=60?(s/60).toFixed(0)+'m':s.toFixed(0)+'s';}
 async function poll(){
   try{
@@ -1021,6 +1024,14 @@ async function poll(){
         li.innerHTML='<b>'+(n.type||'').toUpperCase()+'</b> <span>'+n.iso+'</span><br>'
                      +(n.note||'');
         inc.appendChild(li);});
+      // follow-up voice: read the VLM scene note aloud once it lands
+      // (queued, so it never cuts off the instant alarm phrase)
+      const nw=d.incidents[d.incidents.length-1];
+      const key=nw.iso+nw.type+(nw.note||'');
+      if(lastIncKey!==null&&key!==lastIncKey&&$('detailvoice').checked
+         &&nw.note&&nw.note!=='scene review unavailable')
+        say('Detail: '+nw.note.slice(0,220),true);
+      lastIncKey=key;
     }
     if(d.source!==undefined){
       const digit=/^[0-9]+$/.test(d.source);
