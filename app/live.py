@@ -611,8 +611,12 @@ PWA_MANIFEST = json.dumps({
 })
 
 PWA_ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
-            '<rect width="100" height="100" rx="18" fill="#0d1418"/>'
-            '<text x="50" y="68" font-size="52" text-anchor="middle">🚧</text></svg>')
+            '<rect width="100" height="100" rx="18" fill="#155E75"/>'
+            '<path d="M50 24 79 74 21 74Z" fill="none" stroke="#fff" '
+            'stroke-width="6" stroke-linejoin="round"/>'
+            '<line x1="50" y1="44" x2="50" y2="58" stroke="#fff" '
+            'stroke-width="6" stroke-linecap="round"/>'
+            '<circle cx="50" cy="66" r="3.5" fill="#fff"/></svg>')
 
 # minimal fetch handler makes the app installable when served over HTTPS
 PWA_SW = "self.addEventListener('fetch',()=>{});"
@@ -658,6 +662,9 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             elif self.path == "/sw.js":
                 self._static(PWA_SW, "text/javascript")
             elif self.path.startswith("/cameras"):
+                from urllib.parse import parse_qs, urlparse
+                if parse_qs(urlparse(self.path).query).get("refresh"):
+                    _CAM_CACHE["t"] = 0.0  # force re-probe (new device plugged in)
                 current = sources.current if isinstance(sources.current, int) else None
                 body = json.dumps(list_local_cameras(current)).encode()
                 self.send_response(200)
@@ -920,21 +927,48 @@ letter-spacing:0;text-transform:none}
 .circ.off{background:#d93025;border-color:#d93025}
 #pills{display:flex;gap:10px;padding:2px 14px 12px;flex-wrap:wrap;align-items:center;
 justify-content:center}
-.pill{background:#fff;border:1px solid var(--line);color:var(--ink);
-border-radius:999px;padding:9px 16px;font-size:12.5px;cursor:pointer;
+.pill,.pillwrap{background:#fff;border:1px solid var(--line);color:var(--ink);
+border-radius:999px;font-size:12.5px;
 letter-spacing:0;text-transform:none;font-family:"Barlow","Segoe UI",sans-serif;
 font-weight:500}
-select.pill{appearance:none;-webkit-appearance:none;padding-right:26px;
-background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),
-linear-gradient(135deg,var(--mut) 50%,transparent 50%);
-background-position:calc(100% - 16px) 55%,calc(100% - 12px) 55%;
-background-size:4px 4px;background-repeat:no-repeat;max-width:280px}
-input.pill{cursor:text;min-width:180px;flex:1}
-button.pill:hover,select.pill:hover{border-color:var(--cyan);background:var(--tint)}
+.pill{padding:9px 16px;cursor:pointer}
+.pillwrap{display:flex;align-items:center;gap:8px;padding:0 6px 0 14px;min-height:38px}
+.pillwrap svg,.iconbtn svg{width:16px;height:16px;fill:none;stroke:var(--mut);
+stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
+.pillwrap select,.pillwrap input{border:none;background:none;outline:none;
+color:var(--ink);font:inherit;padding:8px 6px 8px 0;min-width:0}
+.pillwrap select{cursor:pointer;max-width:230px}
+.pillwrap.grow{flex:1;min-width:190px}
+.pillwrap.grow input{flex:1;width:100%}
+.pillwrap:focus-within,.pillwrap:hover,button.pill:hover{border-color:var(--cyan);
+background:var(--tint)}
+.iconbtn{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);
+background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;
+padding:0}
+.iconbtn:hover{border-color:var(--cyan);background:var(--tint)}
+.iconbtn.spin svg{animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.circ svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:2;
+stroke-linecap:round;stroke-linejoin:round}
 #srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
 #autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
 cursor:pointer}
 #autolbl input{accent-color:var(--cyan)}
+@media(max-width:640px){
+  header{padding:10px 12px;gap:8px}
+  header h1{font-size:14px;letter-spacing:.04em}
+  main{padding:10px;gap:10px}
+  #viewwrap{margin:8px;border-radius:8px}
+  #view{min-height:200px}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  #pills{padding:2px 10px 10px;gap:8px}
+  .pillwrap{min-height:44px}
+  .pillwrap select{max-width:none;flex:1}
+  .pillwrap,.pillwrap:not(.grow){flex:1 1 100%}
+  .iconbtn{width:44px;height:44px;flex:0 0 auto}
+  .circ{width:52px;height:52px}
+  button{min-height:40px}
+}
 </style></head><body>
 <header>
   <span class="tag">Site Safety Monitor</span>
@@ -952,19 +986,29 @@ cursor:pointer}
       <span id="namechip">Site camera</span>
       <span id="viewtag">ANNOTATED</span>
       <div id="vidctl">
-        <button class="circ" id="cambtn" title="Turn camera on/off">🎥</button>
-        <button class="circ" id="mutebtn" title="Voice alerts on/off">🔊</button>
+        <button class="circ" id="cambtn" title="Turn camera on/off"></button>
+        <button class="circ" id="mutebtn" title="Voice alerts on/off"></button>
       </div>
     </div>
     <div id="pills">
-      <select id="camsel" class="pill" title="Camera device">
-        <option value="">📷 scanning cameras…</option>
-      </select>
-      <select id="viewsel" class="pill" title="View">
-        <option value="/stream.mjpg" data-tag="ANNOTATED">🖼 Annotated view</option>
-        <option value="/raw.mjpg" data-tag="DIRECT">🎬 Direct view</option>
-      </select>
-      <input id="srcin" class="pill" placeholder="📱 phone / IP camera URL">
+      <label class="pillwrap" title="Camera device">
+        <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        <select id="camsel"><option value="">scanning cameras…</option></select>
+      </label>
+      <button class="iconbtn" id="rescan" title="Rescan for new cameras">
+        <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+      <label class="pillwrap" title="View">
+        <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        <select id="viewsel">
+          <option value="/stream.mjpg" data-tag="ANNOTATED">Annotated view</option>
+          <option value="/raw.mjpg" data-tag="DIRECT">Direct view</option>
+        </select>
+      </label>
+      <label class="pillwrap grow" title="Network camera">
+        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+        <input id="srcin" placeholder="phone / IP camera URL">
+      </label>
       <button id="srcgo" class="pill">Connect</button>
       <span id="srcnow"></span>
     </div>
@@ -1008,8 +1052,15 @@ cursor:pointer}
 <script>
 let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[],lastIncKey=null;
 const $=id=>document.getElementById(id);
+const IC={
+cam:'<svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>',
+camOff:'<svg viewBox="0 0 24 24"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+vol:'<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>',
+volOff:'<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>'};
+$('cambtn').innerHTML=IC.cam;
+$('mutebtn').innerHTML=IC.vol;
 $('mutebtn').onclick=()=>{muted=!muted;
-  $('mutebtn').textContent=muted?'🔇':'🔊';
+  $('mutebtn').innerHTML=muted?IC.volOff:IC.vol;
   $('mutebtn').classList.toggle('off',muted);
   if(!muted)say('Voice alerts enabled');};
 function say(text,queue){
@@ -1071,14 +1122,14 @@ async function poll(){
       const cam=digit?camList.find(c=>String(c.index)===d.source):null;
       const label=cam?cam.label:(digit?'Camera '+d.source
         :d.source.split(/[\\/]/).pop());
-      $('namechip').textContent=(d.camera_on?'':'🚫 ')+label;
+      $('namechip').textContent=(d.camera_on?'':'OFF · ')+label;
       if(digit&&document.activeElement!==$('camsel'))$('camsel').value=d.source;
       if(!$('srcnow').textContent.startsWith('Switching'))
         $('srcnow').textContent=(d.camera_on?'live':'camera off')
           +'  ·  viewers: '+d.viewers;}
     if(d.camera_on!==undefined){
       camOn=d.camera_on;
-      $('cambtn').textContent=camOn?'🎥':'🚫';
+      $('cambtn').innerHTML=camOn?IC.cam:IC.camOff;
       $('cambtn').classList.toggle('off',!camOn);}
     if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
       $('autooff').checked=d.auto_off;
@@ -1100,15 +1151,21 @@ async function switchSrc(v){
     $('srcnow').textContent='Current source: '+d.source;}
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
 $('srcgo').onclick=()=>switchSrc($('srcin').value.trim());
-async function loadCams(){
-  try{const r=await fetch('/cameras');camList=await r.json();
-    const sel=$('camsel');sel.innerHTML='';
+async function loadCams(refresh){
+  if(refresh)$('rescan').classList.add('spin');
+  try{const r=await fetch('/cameras'+(refresh?'?refresh=1':''));
+    camList=await r.json();
+    const sel=$('camsel');const prev=sel.value;sel.innerHTML='';
     camList.forEach(c=>{const o=document.createElement('option');
-      o.value=String(c.index);o.textContent='📷 '+c.label;sel.appendChild(o);});
+      o.value=String(c.index);o.textContent=c.label;sel.appendChild(o);});
     if(!camList.length){const o=document.createElement('option');
-      o.value='';o.textContent='📷 no local camera found';sel.appendChild(o);}
-  }catch(e){}}
+      o.value='';o.textContent='no local camera found';sel.appendChild(o);}
+    if(prev&&[...sel.options].some(o=>o.value===prev))sel.value=prev;
+  }catch(e){}
+  $('rescan').classList.remove('spin');}
 loadCams();
+setInterval(()=>loadCams(true),30000); // pick up newly plugged cameras (RealSense)
+$('rescan').onclick=()=>loadCams(true);
 $('camsel').onchange=()=>{if($('camsel').value!=='')switchSrc($('camsel').value);};
 $('viewsel').onchange=()=>{
   const o=$('viewsel').selectedOptions[0];
@@ -1117,7 +1174,7 @@ $('viewsel').onchange=()=>{
 $('cambtn').onclick=async()=>{
   try{const r=await fetch('/camera?on='+(camOn?0:1));const d=await r.json();
     camOn=d.camera_on;
-    $('cambtn').textContent=camOn?'🎥':'🚫';
+    $('cambtn').innerHTML=camOn?IC.cam:IC.camOff;
     $('cambtn').classList.toggle('off',!camOn);}
   catch(e){}};
 $('autooff').onchange=()=>fetch('/camera?auto='+($('autooff').checked?1:0));
