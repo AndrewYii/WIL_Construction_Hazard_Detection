@@ -679,6 +679,38 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             else:
                 self.send_error(404)
 
+        def do_POST(self):
+            if not self.path.startswith("/upload"):
+                self.send_error(404)
+                return
+            import re
+            import tempfile
+            from urllib.parse import parse_qs, urlparse
+            name = (parse_qs(urlparse(self.path).query).get("name")
+                    or ["upload.mp4"])[0]
+            safe = re.sub(r"[^\w.\-]", "_", name)[-80:] or "upload.mp4"
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > 2_000_000_000:
+                self.send_error(400, "bad upload size")
+                return
+            path = Path(tempfile.mkdtemp(prefix="siteguard_")) / safe
+            with open(path, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            sources.start(str(path), loop_file=True)  # loops for the demo
+            print(f"[live] uploaded video now playing: {safe}")
+            body = json.dumps({"ok": True, "source": safe}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _static(self, text: str, content_type: str):
             body = text.encode()
             self.send_response(200)
@@ -948,6 +980,8 @@ padding:0}
 .iconbtn:hover{border-color:var(--cyan);background:var(--tint)}
 .iconbtn.spin svg{animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+button.pill svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;
+stroke-linecap:round;stroke-linejoin:round;vertical-align:-2px;margin-right:7px}
 .circ svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:2;
 stroke-linecap:round;stroke-linejoin:round}
 #srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
@@ -1005,11 +1039,10 @@ cursor:pointer}
           <option value="/raw.mjpg" data-tag="DIRECT">Direct view</option>
         </select>
       </label>
-      <label class="pillwrap grow" title="Network camera">
-        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-        <input id="srcin" placeholder="phone / IP camera URL">
-      </label>
-      <button id="srcgo" class="pill">Connect</button>
+      <button class="pill" id="upbtn" title="Run detection on a video file (loops)">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload video</button>
+      <input type="file" id="upfile" accept="video/*" hidden>
       <span id="srcnow"></span>
     </div>
     <div class="stats">
@@ -1150,11 +1183,17 @@ async function switchSrc(v){
   try{const r=await fetch('/switch?src='+encodeURIComponent(v));const d=await r.json();
     $('srcnow').textContent='Current source: '+d.source;}
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
-$('srcgo').onclick=()=>switchSrc($('srcin').value.trim());
 async function loadCams(refresh){
   if(refresh)$('rescan').classList.add('spin');
   try{const r=await fetch('/cameras'+(refresh?'?refresh=1':''));
-    camList=await r.json();
+    const fresh=await r.json();
+    // announce newly plugged devices (e.g. RealSense connected mid-session)
+    if(camList.length){
+      const known=new Set(camList.map(c=>c.index));
+      fresh.filter(c=>!known.has(c.index)).forEach(c=>{
+        $('srcnow').textContent='New camera detected: '+c.label;
+        say('New camera detected: '+c.label,true);});}
+    camList=fresh;
     const sel=$('camsel');const prev=sel.value;sel.innerHTML='';
     camList.forEach(c=>{const o=document.createElement('option');
       o.value=String(c.index);o.textContent=c.label;sel.appendChild(o);});
@@ -1164,8 +1203,21 @@ async function loadCams(refresh){
   }catch(e){}
   $('rescan').classList.remove('spin');}
 loadCams();
-setInterval(()=>loadCams(true),30000); // pick up newly plugged cameras (RealSense)
+setInterval(()=>loadCams(true),20000); // auto-detect newly plugged cameras
 $('rescan').onclick=()=>loadCams(true);
+$('upbtn').onclick=()=>$('upfile').click();
+$('upfile').onchange=()=>{
+  const f=$('upfile').files[0];if(!f)return;
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/upload?name='+encodeURIComponent(f.name));
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)
+    $('srcnow').textContent='Uploading '+f.name+' — '
+      +Math.round(e.loaded/e.total*100)+'%';};
+  xhr.onload=()=>{$('srcnow').textContent='Detecting on uploaded video (loops): '+f.name;};
+  xhr.onerror=()=>{$('srcnow').textContent='Upload failed.';};
+  $('srcnow').textContent='Uploading '+f.name+' …';
+  xhr.send(f);
+  $('upfile').value='';};
 $('camsel').onchange=()=>{if($('camsel').value!=='')switchSrc($('camsel').value);};
 $('viewsel').onchange=()=>{
   const o=$('viewsel').selectedOptions[0];
