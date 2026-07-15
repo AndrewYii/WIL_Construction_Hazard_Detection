@@ -92,6 +92,34 @@ def test_independent_hazard_types(tmp_path):
     assert {e["type"] for e in fired} == {"proximity", "height"}
 
 
+def test_dynamic_message_overrides_default(tmp_path):
+    clock = FakeClock()
+    engine = make_engine(tmp_path, clock, trigger=1)
+    fired = engine.update({"proximity"},
+                          messages={"proximity": "Warning! Two workers too "
+                                                 "close to vehicle on the left."})
+    assert "on the left" in fired[0]["message"]
+    # missing override falls back to the fixed phrase
+    clock.t += 100
+    fired = engine.update({"proximity"}, messages={})
+    assert fired[0]["message"].startswith("Warning! Worker too close")
+
+
+def test_compose_alert_messages_describes_scene():
+    from live import compose_alert_messages
+    worker_a = Detection(0, 0.9, (50, 100, 90, 260))
+    worker_b = Detection(0, 0.9, (120, 100, 160, 260))
+    vehicle = Detection(1, 0.9, (10, 80, 200, 300))     # left third of frame
+    msgs = compose_alert_messages(
+        hazard_pairs=[(worker_a, vehicle), (worker_b, vehicle)],
+        moving_vehicles=[vehicle], elevated=[],
+        workers=[worker_a, worker_b], frame_w=1280)
+    assert msgs["proximity"] == ("Warning! 2 workers too close to vehicle "
+                                 "on the left. Move away now.")
+    assert "Vehicle moving on the left, 2 workers nearby." in msgs["vehicle"]
+    assert "height" not in msgs
+
+
 # --------------------------------------------------------------------------
 # Hazard layer
 # --------------------------------------------------------------------------

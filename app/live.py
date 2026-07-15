@@ -470,6 +470,36 @@ def draw_hud(frame, state: SessionState):
     return frame
 
 
+def _side(x: float, frame_w: float) -> str:
+    third = frame_w / 3
+    return "left" if x < third else ("right" if x > 2 * third else "center")
+
+
+def compose_alert_messages(hazard_pairs, moving_vehicles, elevated, workers,
+                           frame_w: float) -> dict[str, str]:
+    """Scene-specific spoken phrases built from detection geometry — composed
+    in microseconds at the moment of detection, no model involved, so the
+    descriptive voice alert still fires on the spot."""
+    def at(det):
+        side = _side((det.xyxy[0] + det.xyxy[2]) / 2, frame_w)
+        return "in the center" if side == "center" else f"on the {side}"
+
+    msgs = {}
+    if hazard_pairs:
+        n = len({id(w) for w, _ in hazard_pairs})
+        who = "One worker" if n == 1 else f"{n} workers"
+        msgs["proximity"] = (f"Warning! {who} too close to vehicle "
+                             f"{at(hazard_pairs[0][1])}. Move away now.")
+    if moving_vehicles:
+        n_w = len(workers)
+        tail = (f", {n_w} worker{'s' if n_w != 1 else ''} nearby." if n_w else ".")
+        msgs["vehicle"] = f"Caution! Vehicle moving {at(moving_vehicles[0])}{tail}"
+    if elevated:
+        msgs["height"] = (f"Warning! Worker at height {at(elevated[0])}. "
+                          "Check fall protection.")
+    return msgs
+
+
 # --------------------------------------------------------------------------
 # Detection loop
 # --------------------------------------------------------------------------
@@ -520,9 +550,12 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         if elevated:
             active.add("height")
 
-        fired = engine.update(active, detail={"frame": state.frames,
-                                              "workers": len(workers),
-                                              "pairs": len(hazard_pairs)})
+        fired = engine.update(
+            active,
+            detail={"frame": state.frames, "workers": len(workers),
+                    "pairs": len(hazard_pairs)},
+            messages=compose_alert_messages(hazard_pairs, moving_vehicles,
+                                            elevated, workers, frame.shape[1]))
 
         # --- bookkeeping ----------------------------------------------------
         n_workers = len(workers)

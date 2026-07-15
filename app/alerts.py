@@ -71,14 +71,15 @@ class AudioPlayer:
         self.clips = clips if clips is not None else (synthesize_clips() if enabled else {})
         self._busy = threading.Lock()
 
-    def play(self, kind: str):
+    def play(self, kind: str, text: str | None = None):
         if not self.enabled:
             return
         if not self._busy.acquire(blocking=False):
             return  # something already playing
-        threading.Thread(target=self._play_blocking, args=(kind,), daemon=True).start()
+        threading.Thread(target=self._play_blocking, args=(kind, text),
+                         daemon=True).start()
 
-    def _play_blocking(self, kind: str):
+    def _play_blocking(self, kind: str, text: str | None = None):
         try:
             path = self.clips.get(kind)
             if platform.system() == "Windows":
@@ -88,7 +89,20 @@ class AudioPlayer:
                 else:
                     winsound.Beep(1200, 350)
                     winsound.Beep(900, 350)
-            elif path:
+                return
+            # Linux (Spark): speak the scene-specific text directly —
+            # espeak-ng starts in ~0.2s, so dynamic phrases stay on-the-spot
+            if text:
+                import shutil
+                if shutil.which("espeak-ng"):
+                    try:
+                        subprocess.run(["espeak-ng", "-s", "165", "-a", "180", text],
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, timeout=15)
+                        return
+                    except Exception:
+                        pass
+            if path:
                 for player in (["aplay", "-q"], ["paplay"], ["ffplay", "-nodisp", "-autoexit",
                                                              "-loglevel", "quiet"]):
                     try:
@@ -138,9 +152,12 @@ class AlertEngine:
         if self.events_path:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def update(self, active: set[str], detail: dict | None = None) -> list[dict]:
+    def update(self, active: set[str], detail: dict | None = None,
+               messages: dict[str, str] | None = None) -> list[dict]:
         """One detection pass. `active` = hazard types present this pass.
-        Returns the alerts that fired now (usually empty)."""
+        `messages` optionally overrides the spoken/logged phrase per type with
+        a scene-specific one composed from detection geometry (still instant —
+        no model call). Returns the alerts that fired now (usually empty)."""
         fired = []
         now = self.clock()
         with self._lock:
@@ -155,7 +172,7 @@ class AlertEngine:
                             "time": now,
                             "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
                             "type": kind,
-                            "message": ALERT_PHRASES[kind],
+                            "message": (messages or {}).get(kind) or ALERT_PHRASES[kind],
                             **(detail or {}),
                         }
                         fired.append(event)
@@ -167,7 +184,7 @@ class AlertEngine:
         for event in fired:
             self._log(event)
             if self.player:
-                self.player.play(event["type"])
+                self.player.play(event["type"], text=event["message"])
         return fired
 
     def counts(self) -> dict[str, int]:
