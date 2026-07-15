@@ -187,6 +187,32 @@ class AlertEngine:
                 self.player.play(event["type"], text=event["message"])
         return fired
 
+    def fire_now(self, kind: str, message: str | None = None,
+                 detail: dict | None = None) -> dict | None:
+        """Fire one alert immediately (used by verified escalations, e.g. the
+        VLM-confirmed height hazard). Respects the per-type cooldown but not
+        the frame debounce. Returns the event, or None if still cooling down."""
+        now = self.clock()
+        with self._lock:
+            st = self._states[kind]
+            if now - st.last_fired < self.cooldown_sec:
+                return None
+            st.last_fired = now
+            st.total_fired += 1
+            event = {
+                "time": now,
+                "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+                "type": kind,
+                "message": message or ALERT_PHRASES[kind],
+                **(detail or {}),
+            }
+            self.recent.append(event)
+            del self.recent[:-50]
+        self._log(event)
+        if self.player:
+            self.player.play(kind, text=event["message"])
+        return event
+
     def counts(self) -> dict[str, int]:
         with self._lock:
             return {k: s.total_fired for k, s in self._states.items()}

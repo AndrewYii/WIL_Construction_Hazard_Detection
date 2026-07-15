@@ -344,6 +344,7 @@ class SessionState:
         self.viewers = 0                  # open MJPEG connections
         self.auto_off = True              # camera auto-off when last viewer leaves
         self.mirror = False               # horizontal flip (front-facing cameras)
+        self.height_flash_until = 0.0     # banner window after verified height alert
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -384,6 +385,32 @@ class SessionState:
             }
 
 
+def parse_ppe(text: str | None) -> dict | None:
+    """Extract {'hardhat': bool, 'harness': bool} from a VLM reply, or None
+    if the reply is unusable (treated as unverified → alert fires anyway)."""
+    if not text:
+        return None
+    import re
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return {"hardhat": bool(parsed.get("hardhat")),
+                "harness": bool(parsed.get("harness"))}
+    except Exception:
+        return None
+
+
+def crop_person(frame, det, margin: float = 0.35):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = det.xyxy
+    mx, my = (x2 - x1) * margin, (y2 - y1) * margin
+    a, b = max(int(x1 - mx), 0), max(int(y1 - my), 0)
+    c, d = min(int(x2 + mx), w), min(int(y2 + my), h)
+    return frame[b:d, a:c].copy()
+
+
 class IncidentAnalyst(threading.Thread):
     """On-the-spot reasoning path. The instant voice alert has already fired
     (milliseconds); this thread takes the flagged snapshot to the Spark:
@@ -399,26 +426,75 @@ class IncidentAnalyst(threading.Thread):
         "arrangement. No preamble, no speculation beyond the image."
     )
 
-    def __init__(self, state: SessionState,
+    PPE_PROMPT = (
+        "This cropped image shows a construction worker who appears to be "
+        "working at height. Check fall-protection equipment. Respond ONLY "
+        'with compact JSON: {"hardhat": true/false, "harness": true/false}. '
+        "harness means a visible safety harness, lanyard, or fall-arrest strap."
+    )
+
+    def __init__(self, state: SessionState, engine: AlertEngine | None = None,
                  report_refresh_sec: float = config.REPORT_REFRESH_SEC):
         super().__init__(daemon=True)
         self.state = state
+        self.engine = engine
         self.report_refresh_sec = report_refresh_sec
         self._jobs: queue.Queue = queue.Queue(maxsize=4)
         self._last_report = 0.0
 
     def submit(self, event: dict, frame):
         try:
-            self._jobs.put_nowait((event, frame))
+            self._jobs.put_nowait(("incident", event, frame))
         except queue.Full:
             pass  # analysis is best-effort; the alert itself already fired
+
+    def submit_height(self, message: str, crop):
+        """Verify a geometric height candidate: alert only if the worker has
+        no visible fall protection (or if verification is impossible)."""
+        try:
+            self._jobs.put_nowait(("height", message, crop))
+        except queue.Full:
+            pass
+
+    def _verify_height(self, client, message: str, crop):
+        verdict = None
+        try:
+            ok, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok and client.is_up():
+                verdict = parse_ppe(client.describe_image(self.PPE_PROMPT,
+                                                          jpg.tobytes()))
+        except Exception:
+            verdict = None
+        protected = bool(verdict and (verdict["harness"] or verdict["hardhat"]))
+        if protected:
+            note = ("Height check: worker elevated but fall-protection PPE "
+                    f"visible (hardhat={verdict['hardhat']}, "
+                    f"harness={verdict['harness']}) — alarm suppressed.")
+        else:
+            if verdict is None:
+                message += " PPE could not be verified."
+            fired = self.engine.fire_now("height", message) if self.engine else None
+            note = ("Height ALERT: no fall-protection PPE visible on elevated "
+                    "worker." if fired else
+                    "Height: elevated without PPE, alarm cooling down.")
+            if fired:
+                with self.state.lock:
+                    self.state.height_flash_until = time.time() + 6
+        with self.state.lock:
+            self.state.incidents.append({
+                "iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "height", "note": note})
+            del self.state.incidents[:-50]
 
     def run(self):
         from llm_client import get_client
         from report_generation import generate_hazard_report
         client = get_client()
         while True:
-            event, frame = self._jobs.get()
+            kind, event, frame = self._jobs.get()
+            if kind == "height":
+                self._verify_height(client, event, frame)
+                continue
             note = None
             try:
                 ok, jpg = cv2.imencode(".jpg", frame,
@@ -517,14 +593,18 @@ def _side(x: float, frame_w: float) -> str:
     return "left" if x < third else ("right" if x > 2 * third else "center")
 
 
+def _at_side(det, frame_w: float) -> str:
+    side = _side((det.xyxy[0] + det.xyxy[2]) / 2, frame_w)
+    return "in the center" if side == "center" else f"on the {side}"
+
+
 def compose_alert_messages(hazard_pairs, moving_vehicles, elevated, workers,
                            frame_w: float) -> dict[str, str]:
     """Scene-specific spoken phrases built from detection geometry — composed
     in microseconds at the moment of detection, no model involved, so the
     descriptive voice alert still fires on the spot."""
     def at(det):
-        side = _side((det.xyxy[0] + det.xyxy[2]) / 2, frame_w)
-        return "in the center" if side == "center" else f"on the {side}"
+        return _at_side(det, frame_w)
 
     msgs = {}
     if hazard_pairs:
@@ -555,6 +635,8 @@ def detection_loop(args, detector, in_slot: LatestFrame,
     frame_shape = None
     last_seq = 0
     fps_smooth = None
+    height_since = None       # when the current elevated streak began
+    last_height_check = 0.0   # last VLM PPE verification
 
     while not stop_flag.is_set():
         frame, last_seq = in_slot.get(last_seq)
@@ -594,8 +676,24 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             active.add("proximity")
         if moving_vehicles and workers:
             active.add("vehicle")
+        # Height is verified, not alarmed raw: workers legitimately work at
+        # height. A stable candidate goes to the VLM for a PPE check; the
+        # alarm only fires if no fall protection is visible (or the check is
+        # impossible). Without the analyst, fall back to the raw geometric alarm.
         if elevated:
-            active.add("height")
+            if height_since is None:
+                height_since = t0
+            if analyst is None:
+                active.add("height")
+            elif (t0 - height_since >= 2.0
+                    and t0 - last_height_check >= 30.0):
+                last_height_check = t0
+                worker = elevated[0]
+                msg = (f"Warning! Worker at height {_at_side(worker, frame.shape[1])} "
+                       "without visible fall protection. Check fall protection.")
+                analyst.submit_height(msg, crop_person(frame, worker))
+        else:
+            height_since = None
 
         fired = engine.update(
             active,
@@ -619,7 +717,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             state.totals["dangerous_vehicle"] += n_vehicles
             state.peak["worker"] = max(state.peak["worker"], n_workers)
             state.peak["dangerous_vehicle"] = max(state.peak["dangerous_vehicle"], n_vehicles)
-            state.active_hazards = sorted(active)
+            display = active | ({"height"}
+                                if t0 < state.height_flash_until else set())
+            state.active_hazards = sorted(display)
             if hazard_pairs:
                 state.proximity_events.append({
                     "frame": state.frames,
@@ -628,7 +728,7 @@ def detection_loop(args, detector, in_slot: LatestFrame,
                 })
                 del state.proximity_events[:-5000]
 
-        annotated = annotate(frame, detections, sorted(active), hazard_pairs)
+        annotated = annotate(frame, detections, sorted(display), hazard_pairs)
         annotated = draw_hud(annotated, state)
         out_slot.put(annotated)
 
@@ -1445,7 +1545,7 @@ def main():
 
     analyst = None
     if not args.no_analysis:
-        analyst = IncidentAnalyst(state)
+        analyst = IncidentAnalyst(state, engine)
         analyst.start()
 
     stop_flag = threading.Event()

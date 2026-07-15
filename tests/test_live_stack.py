@@ -105,6 +105,26 @@ def test_dynamic_message_overrides_default(tmp_path):
     assert fired[0]["message"].startswith("Warning! Worker too close")
 
 
+def test_fire_now_respects_cooldown(tmp_path):
+    clock = FakeClock()
+    engine = make_engine(tmp_path, clock, cooldown=6.0)
+    assert engine.fire_now("height", "Worker at height without PPE.") is not None
+    assert engine.fire_now("height") is None          # cooling down
+    clock.t += 7
+    assert engine.fire_now("height") is not None
+    assert engine.counts()["height"] == 2
+
+
+def test_parse_ppe_verdicts():
+    from live import parse_ppe
+    assert parse_ppe('{"hardhat": true, "harness": false}') == {
+        "hardhat": True, "harness": False}
+    assert parse_ppe('Sure! {"hardhat": false, "harness": false} done') == {
+        "hardhat": False, "harness": False}
+    assert parse_ppe("I cannot tell from this image.") is None
+    assert parse_ppe(None) is None
+
+
 def test_public_source_hides_internal_paths():
     from live import public_source
     assert public_source(0) == "0"
