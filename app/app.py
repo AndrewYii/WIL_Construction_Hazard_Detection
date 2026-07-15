@@ -41,6 +41,42 @@ def get_alert_engine():
     return AlertEngine(events_path=None, player=AudioPlayer())
 
 
+@st.cache_data(ttl=120, show_spinner="Scanning for cameras...")
+def list_cameras(max_probe: int = 5) -> list[dict]:
+    """Enumerate working local cameras (Meet-style device list).
+    Windows device names come from PnP; order usually matches OpenCV index
+    order. Returns [{'index': int, 'label': str}, ...]."""
+    import platform
+    import subprocess
+
+    import cv2
+
+    names = []
+    if platform.system() == "Windows":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_PnPEntity | Where-Object "
+                 "{$_.PNPClass -in 'Camera','Image'} | "
+                 "Select-Object -ExpandProperty Name"],
+                capture_output=True, text=True, timeout=10).stdout
+            names = [line.strip() for line in out.splitlines() if line.strip()]
+        except Exception:
+            pass
+
+    backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+    cams = []
+    for i in range(max_probe):
+        cap = cv2.VideoCapture(i, backend)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            name = names[i] if i < len(names) else f"Camera {i}"
+            cams.append({"index": i, "label": f"{name} ({width}x{height})"})
+        cap.release()
+    return cams
+
+
 def _live_info(port: int) -> dict | None:
     """Live monitor status, or None if it isn't running."""
     import urllib.request
@@ -68,17 +104,36 @@ def _render_realtime(right):
     port = config.DASHBOARD_PORT
     st.caption("Continuous camera monitoring with on-the-spot voice alerts, "
                "subtitles, and AI incident analysis.")
-    cam = st.segmented_control(
-        "Camera", ["Webcam 0", "Camera 1 / RealSense", "Phone / IP camera"],
-        default="Webcam 0") or "Webcam 0"
-    if cam == "Phone / IP camera":
-        src = st.text_input("Stream URL",
-                            placeholder="http://192.168.0.5:8080/video").strip()
-    else:
-        src = "0" if cam.startswith("Webcam") else "1"
 
     info = _live_info(port)
     running = info is not None
+
+    cams = list_cameras()
+    # a camera held open by the running monitor can't be probed — keep it listed
+    if running and str(info.get("source", "")).isdigit():
+        used = int(info["source"])
+        if used not in [c["index"] for c in cams]:
+            cams.append({"index": used, "label": f"Camera {used} (in use by monitor)"})
+            cams.sort(key=lambda c: c["index"])
+
+    options = [c["label"] for c in cams] + ["Phone / IP camera (URL)"]
+    pick_col, rescan_col = st.columns([5, 1], vertical_alignment="bottom")
+    cam = pick_col.selectbox("Camera", options,
+                             help="Local cameras detected on this machine, "
+                                  "like a meeting app's device picker.")
+    if rescan_col.button(":material/refresh:", help="Rescan cameras",
+                         width="stretch"):
+        list_cameras.clear()
+        st.rerun()
+    if not cams:
+        st.warning("No local camera detected — plug one in and rescan, "
+                   "or use a phone / IP camera URL.")
+
+    if cam == "Phone / IP camera (URL)":
+        src = st.text_input("Stream URL",
+                            placeholder="http://192.168.0.5:8080/video").strip()
+    else:
+        src = str(cams[options.index(cam)]["index"])
     if not running:
         if st.button("Start real-time monitor", type="primary",
                      width="stretch", disabled=not src):
