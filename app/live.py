@@ -1187,6 +1187,7 @@ $('flipbtn').onclick=async()=>{
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').innerHTML=muted?IC.volOff:IC.vol;
   $('mutebtn').classList.toggle('off',muted);
+  if(muted&&window.speechSynthesis)speechSynthesis.cancel(); // stop mid-sentence
   if(!muted)say('Voice alerts enabled');};
 function say(text,queue){
   if(muted||!window.speechSynthesis)return;
