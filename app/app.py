@@ -41,40 +41,12 @@ def get_alert_engine():
     return AlertEngine(events_path=None, player=AudioPlayer())
 
 
-@st.cache_data(ttl=120, show_spinner="Scanning for cameras...")
+@st.cache_data(ttl=60, show_spinner="Scanning for cameras...")
 def list_cameras(max_probe: int = 5) -> list[dict]:
-    """Enumerate working local cameras (Meet-style device list).
-    Windows device names come from PnP; order usually matches OpenCV index
-    order. Returns [{'index': int, 'label': str}, ...]."""
-    import platform
-    import subprocess
-
-    import cv2
-
-    names = []
-    if platform.system() == "Windows":
-        try:
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_PnPEntity | Where-Object "
-                 "{$_.PNPClass -in 'Camera','Image'} | "
-                 "Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=10).stdout
-            names = [line.strip() for line in out.splitlines() if line.strip()]
-        except Exception:
-            pass
-
-    backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
-    cams = []
-    for i in range(max_probe):
-        cap = cv2.VideoCapture(i, backend)
-        if cap.isOpened():
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            name = names[i] if i < len(names) else f"Camera {i}"
-            cams.append({"index": i, "label": f"{name} ({width}x{height})"})
-        cap.release()
-    return cams
+    """Device list shared with the live monitor: exact DirectShow / v4l2
+    name-to-index mapping, and it never opens a device (no LED flicker)."""
+    from live import list_local_cameras
+    return list_local_cameras(max_probe=max_probe)
 
 
 def _live_info(port: int) -> dict | None:

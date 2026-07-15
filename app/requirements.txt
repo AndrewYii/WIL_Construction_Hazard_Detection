@@ -7,3 +7,4 @@ scikit-learn
 imageio-ffmpeg
 fpdf2
 pyttsx3
+pygrabber; sys_platform == 'win32'

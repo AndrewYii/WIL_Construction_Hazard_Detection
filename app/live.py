@@ -55,43 +55,51 @@ _CAM_CACHE = {"t": 0.0, "list": []}
 
 
 def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
-    """Meet-style device list: probe OpenCV indices, pair with OS device
-    names (Windows PnP / Linux v4l2). The index currently held open by the
-    monitor can't be probed, so it is kept and marked active. Cached 60s."""
+    """Meet-style device list WITHOUT opening any camera (no LED flicker,
+    no interference with an active capture).
+
+    Windows: DirectShow's own device list (pygrabber) — the order exactly
+    matches cv2.CAP_DSHOW indices, so labels can't be swapped.
+    Linux: /sys/class/video4linux/videoN/name — N is the OpenCV index.
+    Fallback: probe indices by opening them (old behavior). Cached 15s."""
     import platform
     now = time.time()
-    if now - _CAM_CACHE["t"] < 60 and _CAM_CACHE["list"]:
+    if now - _CAM_CACHE["t"] < 15 and _CAM_CACHE["list"]:
         return _CAM_CACHE["list"]
-    names = []
     system = platform.system()
+    cams: list[dict] = []
     try:
         if system == "Windows":
-            import subprocess
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_PnPEntity | Where-Object "
-                 "{$_.PNPClass -in 'Camera','Image'} | "
-                 "Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=10).stdout
-            names = [line.strip() for line in out.splitlines() if line.strip()]
+            import comtypes
+            from pygrabber.dshow_graph import FilterGraph
+            comtypes.CoInitialize()  # handler threads need their own COM init
+            try:
+                names = FilterGraph().get_input_devices()
+            finally:
+                comtypes.CoUninitialize()
+            cams = [{"index": i, "label": n} for i, n in enumerate(names)]
         else:
             import glob
+            import re as _re
             for path in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+                m = _re.search(r"video(\d+)", path)
+                if not m:
+                    continue
                 with open(path) as f:
-                    names.append(f.read().strip())
+                    cams.append({"index": int(m.group(1)),
+                                 "label": f.read().strip()})
     except Exception:
-        pass
-    backend = cv2.CAP_DSHOW if system == "Windows" else cv2.CAP_ANY
-    cams = []
-    for i in range(max_probe):
-        label = names[i] if i < len(names) else f"Camera {i}"
-        if current is not None and i == current:
-            cams.append({"index": i, "label": label})
-            continue
-        cap = cv2.VideoCapture(i, backend)
-        if cap.isOpened():
-            cams.append({"index": i, "label": label})
-        cap.release()
+        cams = []
+    if not cams:  # fallback: probe by opening (may blink camera LEDs)
+        backend = cv2.CAP_DSHOW if system == "Windows" else cv2.CAP_ANY
+        for i in range(max_probe):
+            if current is not None and i == current:
+                cams.append({"index": i, "label": f"Camera {i}"})
+                continue
+            cap = cv2.VideoCapture(i, backend)
+            if cap.isOpened():
+                cams.append({"index": i, "label": f"Camera {i}"})
+            cap.release()
     _CAM_CACHE.update(t=now, list=cams)
     return cams
 
@@ -476,18 +484,13 @@ def _draw_subtitle(frame, text):
     cv2.putText(frame, text, (x, y), FONT, scale, (255, 255, 255), 2)
 
 
-def annotate(frame, detections, hazard_types, hazard_pairs):
+def annotate(frame, detections, hazard_types, hazard_pairs=None):
     for det in detections:
         x1, y1, x2, y2 = [int(v) for v in det.xyxy]
         color = BOX_COLORS.get(det.cls, (200, 200, 200))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         label = f"{CLASS_NAMES.get(det.cls, det.cls)} {det.conf:.2f}"
         cv2.putText(frame, label, (x1, max(y1 - 6, 14)), FONT, 0.5, color, 2)
-    # red link line between each hazard pair
-    for w, v in hazard_pairs:
-        wx, wy = (int((w.xyxy[0] + w.xyxy[2]) / 2), int((w.xyxy[1] + w.xyxy[3]) / 2))
-        vx, vy = (int((v.xyxy[0] + v.xyxy[2]) / 2), int((v.xyxy[1] + v.xyxy[3]) / 2))
-        cv2.line(frame, (wx, wy), (vx, vy), (0, 0, 255), 2)
     y = 34
     for kind in hazard_types:
         text = f"! {HAZARD_LABELS.get(kind, kind.upper())}"
@@ -1300,7 +1303,8 @@ async function loadCams(refresh){
   }catch(e){}
   $('rescan').classList.remove('spin');}
 loadCams();
-setInterval(()=>loadCams(true),20000); // auto-detect newly plugged cameras
+// auto-detect newly plugged cameras — name-list only, never opens a device
+setInterval(()=>loadCams(false),20000);
 $('rescan').onclick=e=>{e.stopPropagation();loadCams(true);};
 // custom dropdowns (native <select> popups can't be styled)
 document.querySelectorAll('.dd').forEach(el=>{
@@ -1372,8 +1376,11 @@ def parse_args():
     p.add_argument("--conf", type=float, default=config.LIVE_CONF)
     p.add_argument("--imgsz", type=int, default=config.LIVE_IMGSZ)
     p.add_argument("--device", default="0", help="CUDA device or 'cpu'")
-    p.add_argument("--no-audio", action="store_true",
-                   help="Disable server-side speaker output")
+    p.add_argument("--audio", action="store_true",
+                   help="Enable server-side speaker output (e.g. a speaker on "
+                        "the Spark). Default off — the dashboard's browser "
+                        "voice speaks the descriptive alert on the spot.")
+    p.add_argument("--no-audio", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-analysis", action="store_true",
                    help="Disable on-the-spot VLM/LLM incident analysis")
     p.add_argument("--autostart", action="store_true",
@@ -1395,7 +1402,7 @@ def main():
     print(f"[live] detector: {getattr(detector, 'label', 'Plan A')}")
     print(f"[live] Ollama (Spark): {config.OLLAMA_HOST}")
 
-    player = None if args.no_audio else AudioPlayer()
+    player = AudioPlayer() if (args.audio and not args.no_audio) else None
     engine = AlertEngine(player=player)
     state = SessionState(engine)
     state.detector_label = getattr(detector, "label", "Plan A — Fine-tuned YOLOv8")
