@@ -298,6 +298,7 @@ class SessionState:
         self.live_report: str = ""        # auto-refreshed LLM report
         self.viewers = 0                  # open MJPEG connections
         self.auto_off = True              # camera auto-off when last viewer leaves
+        self.mirror = False               # horizontal flip (front-facing cameras)
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -318,6 +319,7 @@ class SessionState:
                 "live_report": self.live_report,
                 "viewers": self.viewers,
                 "auto_off": self.auto_off,
+                "mirror": self.mirror,
             }
 
     def to_report_dict(self) -> dict:
@@ -528,6 +530,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             frame_diag = math.hypot(w, h)
             motion = VehicleMotionTracker(frame_diag, config.VEHICLE_MOVE_RATIO_PER_SEC)
 
+        if state.mirror:  # flip before detection so drawn text stays readable
+            frame = cv2.flip(frame, 1)
+
         if raw_slot is not None:
             raw_slot.put(frame.copy())  # untouched view, before drawing
 
@@ -734,10 +739,13 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             if "auto" in qs:
                 with state.lock:
                     state.auto_off = qs["auto"][0] == "1"
+            if "mirror" in qs:
+                with state.lock:
+                    state.mirror = qs["mirror"][0] == "1"
             with state.lock:
-                auto = state.auto_off
+                auto, mirror = state.auto_off, state.mirror
             body = json.dumps({"camera_on": sources.camera_on,
-                               "auto_off": auto}).encode()
+                               "auto_off": auto, "mirror": mirror}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -957,6 +965,7 @@ display:flex;align-items:center;justify-content:center;padding:0;
 letter-spacing:0;text-transform:none}
 .circ:hover{background:rgba(45,60,68,.95)}
 .circ.off{background:#d93025;border-color:#d93025}
+.circ.act{background:var(--cyan);border-color:var(--cyan)}
 #pills{display:flex;gap:10px;padding:2px 14px 12px;flex-wrap:wrap;align-items:center;
 justify-content:center}
 .pill,.pillwrap{background:#fff;border:1px solid var(--line);color:var(--ink);
@@ -1021,6 +1030,7 @@ cursor:pointer}
       <span id="viewtag">ANNOTATED</span>
       <div id="vidctl">
         <button class="circ" id="cambtn" title="Turn camera on/off"></button>
+        <button class="circ" id="flipbtn" title="Mirror / flip camera"></button>
         <button class="circ" id="mutebtn" title="Voice alerts on/off"></button>
       </div>
     </div>
@@ -1089,9 +1099,17 @@ const IC={
 cam:'<svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>',
 camOff:'<svg viewBox="0 0 24 24"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
 vol:'<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>',
-volOff:'<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>'};
+volOff:'<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>',
+flip:'<svg viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>'};
 $('cambtn').innerHTML=IC.cam;
 $('mutebtn').innerHTML=IC.vol;
+$('flipbtn').innerHTML=IC.flip;
+let mirrored=false;
+$('flipbtn').onclick=async()=>{
+  try{const r=await fetch('/camera?mirror='+(mirrored?0:1));const d=await r.json();
+    mirrored=d.mirror;
+    $('flipbtn').classList.toggle('act',mirrored);}
+  catch(e){}};
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').innerHTML=muted?IC.volOff:IC.vol;
   $('mutebtn').classList.toggle('off',muted);
@@ -1166,6 +1184,8 @@ async function poll(){
       $('cambtn').classList.toggle('off',!camOn);}
     if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
       $('autooff').checked=d.auto_off;
+    if(d.mirror!==undefined){mirrored=d.mirror;
+      $('flipbtn').classList.toggle('act',mirrored);}
     if(d.live_report){
       const lr=$('livereport');
       if(lr.textContent!==d.live_report){lr.textContent=d.live_report;}
