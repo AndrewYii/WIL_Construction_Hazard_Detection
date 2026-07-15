@@ -51,6 +51,19 @@ HAZARD_LABELS = {
 }
 
 
+def camera_off_frame(shape=(360, 640, 3)):
+    """Placeholder pushed to the streams when the camera is toggled off, so
+    viewers see an explicit OFF state instead of a frozen last frame."""
+    import numpy as np
+    frame = np.zeros(shape, dtype=np.uint8)
+    h, w = shape[:2]
+    text = "CAMERA OFF"
+    (tw, th), _ = cv2.getTextSize(text, FONT, 1.1, 2)
+    cv2.putText(frame, text, ((w - tw) // 2, (h + th) // 2), FONT, 1.1,
+                (120, 120, 120), 2)
+    return frame
+
+
 # --------------------------------------------------------------------------
 # Frame plumbing
 # --------------------------------------------------------------------------
@@ -138,6 +151,8 @@ class SourceManager:
         self.in_slot = in_slot
         self.capture: CaptureThread | None = None
         self.current = None
+        self.camera_on = False
+        self._loop_file = False
         self._lock = threading.Lock()
 
     def start(self, source, loop_file: bool = False, critical: bool = False) -> bool:
@@ -153,7 +168,22 @@ class SourceManager:
             cap.start()
             self.capture = cap
             self.current = source
+            self.camera_on = True
+            self._loop_file = loop_file
             return True
+
+    def set_camera(self, on: bool):
+        """Meeting-style camera toggle: off releases the device entirely
+        (privacy — its LED goes dark), on reopens the remembered source."""
+        if on:
+            if not self.camera_on and self.current is not None:
+                self.start(self.current, loop_file=self._loop_file)
+            return
+        with self._lock:
+            if self.capture and self.capture.is_alive():
+                self.capture.close_on_exit = False
+                self.capture.stop_flag.set()
+            self.camera_on = False
 
     def stop(self):
         with self._lock:
@@ -221,6 +251,8 @@ class SessionState:
         self.spark_status: dict = {"up": False, "host": config.OLLAMA_HOST, "models": []}
         self.incidents: list[dict] = []   # VLM scene notes per fired alert
         self.live_report: str = ""        # auto-refreshed LLM report
+        self.viewers = 0                  # open MJPEG connections
+        self.auto_off = True              # camera auto-off when last viewer leaves
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -239,6 +271,8 @@ class SessionState:
                 "hazard_labels": HAZARD_LABELS,
                 "incidents": self.incidents[-8:],
                 "live_report": self.live_report,
+                "viewers": self.viewers,
+                "auto_off": self.auto_off,
             }
 
     def to_report_dict(self) -> dict:
@@ -396,7 +430,8 @@ def draw_hud(frame, state: SessionState):
 
 def detection_loop(args, detector, in_slot: LatestFrame,
                    out_slot: LatestFrame, state: SessionState, engine: AlertEngine,
-                   stop_flag: threading.Event, analyst: IncidentAnalyst | None = None):
+                   stop_flag: threading.Event, analyst: IncidentAnalyst | None = None,
+                   raw_slot: LatestFrame | None = None):
     motion = None
     frame_diag = None
     frame_shape = None
@@ -416,6 +451,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             h, w = frame_shape
             frame_diag = math.hypot(w, h)
             motion = VehicleMotionTracker(frame_diag, config.VEHICLE_MOVE_RATIO_PER_SEC)
+
+        if raw_slot is not None:
+            raw_slot.put(frame.copy())  # untouched view, before drawing
 
         detections = detector.predict_frame(frame, conf=args.conf, imgsz=args.imgsz)
 
@@ -475,6 +513,8 @@ def detection_loop(args, detector, in_slot: LatestFrame,
                 analyst.submit(event, annotated.copy())
 
     out_slot.close()
+    if raw_slot is not None:
+        raw_slot.close()
 
 
 # --------------------------------------------------------------------------
@@ -482,7 +522,7 @@ def detection_loop(args, detector, in_slot: LatestFrame,
 # --------------------------------------------------------------------------
 
 def make_handler(out_slot: LatestFrame, state: SessionState,
-                 sources: "SourceManager"):
+                 sources: "SourceManager", raw_slot: LatestFrame | None = None):
     dashboard = DASHBOARD_HTML
 
     class Handler(BaseHTTPRequestHandler):
@@ -497,11 +537,14 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/raw"):
+                self._stream(raw_slot or out_slot)
             elif self.path.startswith("/stream"):
-                self._stream()
+                self._stream(out_slot)
             elif self.path.startswith("/events"):
                 snap = state.snapshot()
                 snap["source"] = str(sources.current)
+                snap["camera_on"] = sources.camera_on
                 body = json.dumps(snap).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -511,10 +554,37 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self.wfile.write(body)
             elif self.path.startswith("/switch"):
                 self._switch()
+            elif self.path.startswith("/camera"):
+                self._camera()
             elif self.path.startswith("/report"):
                 self._report()
             else:
                 self.send_error(404)
+
+        def _camera(self):
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            if "on" in qs:
+                on = qs["on"][0] == "1"
+                sources.set_camera(on)
+                if not on:
+                    placeholder = camera_off_frame()
+                    if raw_slot is not None:
+                        raw_slot.put(placeholder.copy())
+                    out_slot.put(placeholder)
+                print(f"[live] camera {'ON' if on else 'OFF'}")
+            if "auto" in qs:
+                with state.lock:
+                    state.auto_off = qs["auto"][0] == "1"
+            with state.lock:
+                auto = state.auto_off
+            body = json.dumps({"camera_on": sources.camera_on,
+                               "auto_off": auto}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _switch(self):
             from urllib.parse import parse_qs, urlparse
@@ -529,7 +599,7 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.end_headers()
             self.wfile.write(body)
 
-        def _stream(self):
+        def _stream(self, slot: LatestFrame):
             self.send_response(200)
             self.send_header("Age", "0")
             self.send_header("Cache-Control", "no-cache, private")
@@ -538,26 +608,41 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.end_headers()
             seq = 0
             params = [cv2.IMWRITE_JPEG_QUALITY, config.MJPEG_QUALITY]
+            last_jpg = None
+            with state.lock:
+                state.viewers += 1
             try:
                 while True:
-                    frame, seq = out_slot.get(seq)
+                    frame, seq = slot.get(seq)
                     if frame is None:
-                        if out_slot.closed:
+                        if slot.closed:
                             break
+                        # idle (camera off / stalled source): resend the last
+                        # frame as a keepalive so closed tabs are detected and
+                        # the viewer count stays honest
+                        if last_jpg is not None:
+                            self._send_part(last_jpg)
                         continue
                     # JPEG encoding happens here, in the serving thread,
                     # never in the detection loop
                     ok, jpg = cv2.imencode(".jpg", frame, params)
                     if not ok:
                         continue
-                    self.wfile.write(b"--frame\r\n"
-                                     b"Content-Type: image/jpeg\r\n"
-                                     b"Content-Length: " + str(len(jpg)).encode()
-                                     + b"\r\n\r\n")
-                    self.wfile.write(jpg.tobytes())
-                    self.wfile.write(b"\r\n")
+                    last_jpg = jpg.tobytes()
+                    self._send_part(last_jpg)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass  # client closed the tab
+            finally:
+                with state.lock:
+                    state.viewers -= 1
+
+        def _send_part(self, jpg_bytes: bytes):
+            self.wfile.write(b"--frame\r\n"
+                             b"Content-Type: image/jpeg\r\n"
+                             b"Content-Length: " + str(len(jpg_bytes)).encode()
+                             + b"\r\n\r\n")
+            self.wfile.write(jpg_bytes)
+            self.wfile.write(b"\r\n")
 
         def _report(self):
             try:
@@ -574,6 +659,30 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.wfile.write(body)
 
     return Handler
+
+
+def camera_watchdog(state: SessionState, sources: SourceManager,
+                    out_slot: LatestFrame, raw_slot: LatestFrame | None,
+                    grace_sec: float = 15.0):
+    """Meeting-style auto-off: when the last dashboard/stream viewer closes
+    and auto-off is enabled, release the camera after a grace period."""
+    zero_since = None
+    while True:
+        time.sleep(5)
+        with state.lock:
+            viewers, auto = state.viewers, state.auto_off
+        if viewers == 0 and auto and sources.camera_on:
+            zero_since = zero_since or time.time()
+            if time.time() - zero_since >= grace_sec:
+                sources.set_camera(False)
+                placeholder = camera_off_frame()
+                if raw_slot is not None:
+                    raw_slot.put(placeholder.copy())
+                out_slot.put(placeholder)
+                print("[live] no viewers — camera auto-off")
+                zero_since = None
+        else:
+            zero_since = None
 
 
 def local_ip() -> str:
@@ -653,6 +762,22 @@ color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-si
 #srcin{flex:1;min-width:170px;background:#0f1a20;border:1px solid var(--line);
 color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
 #srcnow{font-size:11px;color:var(--mut);width:100%}
+#viewtag{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.65);
+color:#fff;font-size:10px;letter-spacing:.16em;padding:3px 9px;border-radius:2px}
+#tiles{display:flex;gap:8px;padding:10px;background:#0a1013;overflow-x:auto}
+.tile{position:relative;flex:0 0 auto;width:118px;height:68px;border:2px solid var(--line);
+border-radius:4px;overflow:hidden;cursor:pointer;background:#10181d;
+display:flex;align-items:center;justify-content:center}
+.tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile span{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);
+color:#dfe9ec;font-size:10px;letter-spacing:.08em;text-align:center;padding:2px 0}
+.tile.cam span{position:static;background:none;font-size:11px}
+.tile.active{border-color:var(--cyan)}
+.tile:hover{border-color:var(--amber)}
+#cambtn.off{border-color:var(--red);color:var(--red)}
+#autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
+cursor:pointer}
+#autolbl input{accent-color:var(--cyan)}
 </style></head><body>
 <header>
   <span class="tag">Site Safety Monitor</span>
@@ -667,6 +792,16 @@ color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
     <div id="viewwrap">
       <div id="banner">HAZARD</div>
       <img id="view" src="/stream.mjpg" alt="live stream">
+      <span id="viewtag">ANNOTATED</span>
+    </div>
+    <div id="tiles">
+      <div class="tile active" data-view="/stream.mjpg" data-tag="ANNOTATED">
+        <img src="/stream.mjpg" alt=""><span>Annotated</span></div>
+      <div class="tile" data-view="/raw.mjpg" data-tag="DIRECT">
+        <img src="/raw.mjpg" alt=""><span>Direct</span></div>
+      <div class="tile cam" data-src="0"><span>📷 Webcam 0</span></div>
+      <div class="tile cam" data-src="1"><span>📷 RealSense</span></div>
+      <div class="tile cam" id="phonetile"><span>📱 Phone cam</span></div>
     </div>
     <div class="stats">
       <div class="stat"><div class="v" id="workers">0</div><div class="l">Workers</div></div>
@@ -701,6 +836,9 @@ color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
       <span id="srcnow"></span>
     </div>
     <div class="foot">
+      <button id="cambtn">🎥 Camera on</button>
+      <label id="autolbl"><input type="checkbox" id="autooff" checked>
+        auto-off camera when everyone closes</label>
       <button class="mute" id="mutebtn">🔊 Voice on</button>
       <button id="reportbtn">Generate report</button>
       <span id="spark">Spark: checking…</span>
@@ -710,7 +848,7 @@ color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
   </section>
 </main>
 <script>
-let muted=false,lastAlert=0,alertTotal=0;
+let muted=false,lastAlert=0,alertTotal=0,camOn=true;
 const $=id=>document.getElementById(id);
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').textContent=muted?'🔇 Voice off':'🔊 Voice on';
@@ -762,7 +900,14 @@ async function poll(){
         inc.appendChild(li);});
     }
     if(d.source!==undefined&&!$('srcnow').textContent.startsWith('Switching'))
-      $('srcnow').textContent='Current source: '+d.source;
+      $('srcnow').textContent='Current source: '+d.source
+        +(d.camera_on?'':'  (camera off)')+'  ·  viewers: '+d.viewers;
+    if(d.camera_on!==undefined){
+      camOn=d.camera_on;
+      $('cambtn').textContent=camOn?'🎥 Camera on':'🚫 Camera off';
+      $('cambtn').classList.toggle('off',!camOn);}
+    if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
+      $('autooff').checked=d.auto_off;
     if(d.live_report){
       const lr=$('livereport');
       if(lr.textContent!==d.live_report){lr.textContent=d.live_report;}
@@ -782,6 +927,24 @@ async function switchSrc(v){
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
 document.querySelectorAll('.srcbtn').forEach(b=>b.onclick=()=>switchSrc(b.dataset.src));
 $('srcgo').onclick=()=>switchSrc($('srcin').value.trim());
+document.querySelectorAll('.tile[data-view]').forEach(t=>t.onclick=()=>{
+  $('view').src=t.dataset.view;
+  $('viewtag').textContent=t.dataset.tag;
+  document.querySelectorAll('.tile[data-view]').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');});
+document.querySelectorAll('.tile.cam[data-src]').forEach(t=>t.onclick=()=>switchSrc(t.dataset.src));
+$('phonetile').onclick=()=>{
+  const v=$('srcin').value.trim();
+  if(v)switchSrc(v);
+  else{$('srcnow').textContent='Type the phone URL in the box below first.';
+       $('srcin').focus();}};
+$('cambtn').onclick=async()=>{
+  try{const r=await fetch('/camera?on='+(camOn?0:1));const d=await r.json();
+    camOn=d.camera_on;
+    $('cambtn').textContent=camOn?'🎥 Camera on':'🚫 Camera off';
+    $('cambtn').classList.toggle('off',!camOn);}
+  catch(e){}};
+$('autooff').onchange=()=>fetch('/camera?auto='+($('autooff').checked?1:0));
 $('reportbtn').onclick=async()=>{
   const box=$('report');box.style.display='block';
   box.textContent='Generating safety report on the Spark…';
@@ -838,7 +1001,7 @@ def main():
     state.detector_label = getattr(detector, "label", "Plan A — Fine-tuned YOLOv8")
 
     source = args.video if args.video else parse_source(args.source)
-    in_slot, out_slot = LatestFrame(), LatestFrame()
+    in_slot, out_slot, raw_slot = LatestFrame(), LatestFrame(), LatestFrame()
     sources = SourceManager(in_slot)
     sources.start(source, loop_file=bool(args.video), critical=True)
 
@@ -852,15 +1015,20 @@ def main():
     stop_flag = threading.Event()
     det_thread = threading.Thread(
         target=detection_loop,
-        args=(args, detector, in_slot, out_slot, state, engine, stop_flag, analyst),
+        args=(args, detector, in_slot, out_slot, state, engine, stop_flag, analyst,
+              raw_slot),
         daemon=True)
     det_thread.start()
 
     server = None
     try:
         if args.headless:
+            threading.Thread(target=camera_watchdog,
+                             args=(state, sources, out_slot, raw_slot),
+                             daemon=True).start()
             server = ThreadingHTTPServer(("0.0.0.0", args.port),
-                                         make_handler(out_slot, state, sources))
+                                         make_handler(out_slot, state, sources,
+                                                      raw_slot))
             print(f"[live] dashboard:  http://{local_ip()}:{args.port}")
             print(f"[live] MJPEG feed: http://{local_ip()}:{args.port}/stream.mjpg")
             print("[live] Ctrl+C to stop")

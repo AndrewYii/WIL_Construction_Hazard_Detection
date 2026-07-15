@@ -41,13 +41,19 @@ def get_alert_engine():
     return AlertEngine(events_path=None, player=AudioPlayer())
 
 
-def _live_running(port: int) -> bool:
+def _live_info(port: int) -> dict | None:
+    """Live monitor status, or None if it isn't running."""
     import urllib.request
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/events", timeout=1.5):
-            return True
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/events",
+                                    timeout=1.5) as r:
+            return json.load(r)
     except Exception:
-        return False
+        return None
+
+
+def _live_running(port: int) -> bool:
+    return _live_info(port) is not None
 
 
 def _render_realtime(right):
@@ -71,7 +77,8 @@ def _render_realtime(right):
     else:
         src = "0" if cam.startswith("Webcam") else "1"
 
-    running = _live_running(port)
+    info = _live_info(port)
+    running = info is not None
     if not running:
         if st.button("Start real-time monitor", type="primary",
                      width="stretch", disabled=not src):
@@ -90,6 +97,19 @@ def _render_realtime(right):
                      "Streamlit for the error (missing weights or camera).")
     else:
         st.success(f"Real-time monitor is running on port {port}.")
+        cam_on = bool(info.get("camera_on", True))
+        want_on = st.toggle("Camera on", value=cam_on,
+                            help="Off releases the camera device (like a "
+                                 "meeting app). It also auto-offs when the "
+                                 "last viewer closes the page.")
+        if want_on != cam_on:
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/camera?on={1 if want_on else 0}",
+                    timeout=3)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Camera toggle failed: {exc}")
         if st.button("Switch to this camera", width="stretch", disabled=not src):
             try:
                 urllib.request.urlopen(
@@ -105,14 +125,21 @@ def _render_realtime(right):
         host = "localhost"
     right.subheader("Output")
     if running:
-        right.markdown(
-            f'<img src="http://{host}:{port}/stream.mjpg" '
+        d_col, a_col = right.columns(2)
+        d_col.caption("Direct feed")
+        d_col.markdown(
+            f'<img src="http://{host}:{port}/raw.mjpg" '
             f'style="width:100%;border:1px solid {BORDER};border-radius:2px;">',
+            unsafe_allow_html=True)
+        a_col.caption("Annotated (AI detection)")
+        a_col.markdown(
+            f'<img src="http://{host}:{port}/stream.mjpg" '
+            f'style="width:100%;border:2px solid {CYAN};border-radius:2px;">',
             unsafe_allow_html=True)
         right.link_button("Open full dashboard — voice alerts + AI analysis",
                           f"http://{host}:{port}", width="stretch")
         right.caption("The dashboard adds browser voice alerts, hazard counters, "
-                      "the alert log, camera switching, and the live LLM report.")
+                      "the alert log, camera tiles, and the live LLM report.")
     else:
         right.info("Start the monitor to see the live stream here.")
 
