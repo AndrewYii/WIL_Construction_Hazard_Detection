@@ -262,11 +262,24 @@ class SourceManager:
             self._loop_file = loop_file
             self.camera_on = False
 
+    def use_browser(self):
+        """A viewer's device camera becomes the source: frames arrive over
+        HTTP (/ingest) instead of a local capture thread."""
+        with self._lock:
+            if self.capture and self.capture.is_alive():
+                self.capture.close_on_exit = False
+                self.capture.stop_flag.set()
+            self.capture = None
+            self.current = "browser"
+            self.camera_on = True
+
     def set_camera(self, on: bool):
         """Meeting-style camera toggle: off releases the device entirely
         (privacy — its LED goes dark), on reopens the remembered source."""
         if on:
-            if not self.camera_on and self.current is not None:
+            if self.current == "browser":
+                self.camera_on = True  # frames resume from the sender
+            elif not self.camera_on and self.current is not None:
                 self.start(self.current, loop_file=self._loop_file)
             return
         with self._lock:
@@ -770,7 +783,8 @@ PWA_SW = "self.addEventListener('fetch',()=>{});"
 
 
 def make_handler(out_slot: LatestFrame, state: SessionState,
-                 sources: "SourceManager", raw_slot: LatestFrame | None = None):
+                 sources: "SourceManager", raw_slot: LatestFrame | None = None,
+                 in_slot: LatestFrame | None = None):
     dashboard = DASHBOARD_HTML
 
     class Handler(BaseHTTPRequestHandler):
@@ -832,6 +846,9 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path.startswith("/ingest"):
+                self._ingest()
+                return
             if not self.path.startswith("/upload"):
                 self.send_error(404)
                 return
@@ -862,6 +879,34 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _ingest(self):
+            """Viewer-device camera frames (JPEG per POST). ?claim=1 makes
+            the browser the active source; frame posts are rejected with 409
+            once another source takes over, which tells the sender to stop."""
+            from urllib.parse import parse_qs, urlparse
+            if parse_qs(urlparse(self.path).query).get("claim"):
+                sources.use_browser()
+                print("[live] source switched to: viewer device camera")
+                self._static('{"ok": true}', "application/json")
+                return
+            if sources.current != "browser" or not sources.camera_on:
+                self.send_error(409, "browser is not the active source")
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            if not (0 < length <= 3_000_000):
+                self.send_error(400)
+                return
+            data = self.rfile.read(length)
+            try:
+                import numpy as np
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8),
+                                     cv2.IMREAD_COLOR)
+            except Exception:
+                frame = None
+            if frame is not None and in_slot is not None:
+                in_slot.put(frame)
+            self._static('{"ok": true}', "application/json")
 
         def _static(self, text: str, content_type: str):
             body = text.encode()
@@ -1163,6 +1208,7 @@ padding:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 button.pill svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;
 stroke-linecap:round;stroke-linejoin:round;vertical-align:-2px;margin-right:7px}
+button.pill.on{border-color:var(--cyan);background:var(--tint);color:var(--deep)}
 .circ svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:2;
 stroke-linecap:round;stroke-linejoin:round}
 #srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
@@ -1225,6 +1271,9 @@ cursor:pointer}
           <li data-v="/raw.mjpg" data-tag="DIRECT">Direct view</li>
         </ul>
       </div>
+      <button class="pill" id="devcam" title="Stream this device's camera to the server for detection">
+        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="11" r="3.2"/></svg>
+        Use this device camera</button>
       <button class="pill" id="upbtn" title="Run detection on a video file (loops)">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         Upload video</button>
@@ -1365,7 +1414,8 @@ async function poll(){
       const digit=/^[0-9]+$/.test(d.source);
       const cam=digit?camList.find(c=>String(c.index)===d.source):null;
       const label=cam?cam.label:(digit?'Camera '+d.source
-        :d.source.split(/[\\/]/).pop());
+        :(d.source==='browser'?'Device camera (streamed)'
+          :d.source.split(/[\\/]/).pop()));
       $('namechip').textContent=(d.camera_on?'':'OFF · ')+label;
       if(digit&&camSelected!==d.source&&!$('camdd').classList.contains('open')){
         camSelected=d.source;renderCamMenu();}
@@ -1443,6 +1493,39 @@ document.querySelectorAll('.dd').forEach(el=>{
 document.addEventListener('click',e=>{
   if(!e.target.closest('.dd'))
     document.querySelectorAll('.dd.open').forEach(d=>d.classList.remove('open'));});
+// Viewer-device camera -> server: getUserMedia frames posted as JPEG.
+// Needs a secure context (HTTPS or localhost) — hidden otherwise.
+let devStream=null,devTimer=null;
+if(!(window.isSecureContext&&navigator.mediaDevices
+     &&navigator.mediaDevices.getUserMedia))
+  $('devcam').style.display='none';
+function stopDevCam(){
+  if(devTimer){clearInterval(devTimer);devTimer=null;}
+  if(devStream){devStream.getTracks().forEach(t=>t.stop());devStream=null;}
+  $('devcam').classList.remove('on');}
+async function startDevCam(){
+  try{devStream=await navigator.mediaDevices.getUserMedia(
+    {video:{width:{ideal:640},facingMode:'environment'},audio:false});}
+  catch(e){$('srcnow').textContent='Camera permission denied.';return;}
+  await fetch('/ingest?claim=1',{method:'POST'});
+  const v=document.createElement('video');
+  v.srcObject=devStream;v.muted=true;v.playsInline=true;await v.play();
+  const cv=document.createElement('canvas');
+  let busy=false;
+  devTimer=setInterval(()=>{
+    if(busy||!v.videoWidth)return;
+    cv.width=v.videoWidth;cv.height=v.videoHeight;
+    cv.getContext('2d').drawImage(v,0,0);
+    cv.toBlob(async b=>{
+      if(!b)return;busy=true;
+      try{const r=await fetch('/ingest',{method:'POST',body:b});
+        if(r.status===409)stopDevCam();} // another source took over
+      catch(e){}
+      busy=false;},'image/jpeg',0.7);},170);
+  $('devcam').classList.add('on');
+  $('srcnow').textContent='Streaming this device camera to the server.';}
+$('devcam').onclick=()=>devStream?stopDevCam():startDevCam();
+window.addEventListener('pagehide',stopDevCam);
 $('upbtn').onclick=()=>$('upfile').click();
 $('upfile').onchange=()=>{
   const f=$('upfile').files[0];if(!f)return;
@@ -1575,7 +1658,7 @@ def main():
                              daemon=True).start()
             server = ThreadingHTTPServer(("0.0.0.0", args.port),
                                          make_handler(out_slot, state, sources,
-                                                      raw_slot))
+                                                      raw_slot, in_slot))
             print(f"[live] dashboard:  http://{local_ip()}:{args.port}")
             print(f"[live] MJPEG feed: http://{local_ip()}:{args.port}/stream.mjpg")
             print("[live] Ctrl+C to stop")
