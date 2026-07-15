@@ -572,8 +572,8 @@ PWA_MANIFEST = json.dumps({
     "short_name": "SiteGuard",
     "start_url": "/",
     "display": "standalone",
-    "background_color": "#0d1418",
-    "theme_color": "#0d1418",
+    "background_color": "#FFFFFF",
+    "theme_color": "#155E75",
     "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}],
 })
 
@@ -792,69 +792,86 @@ DASHBOARD_HTML = """<!doctype html>
 <title>Site Safety Monitor — Live</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg">
-<meta name="theme-color" content="#0d1418">
+<meta name="theme-color" content="#155E75">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <style>
-:root{--bg:#0d1418;--panel:#132027;--line:#1f3540;--ink:#e8f1f4;--mut:#7fa0ac;
---cyan:#22b8cf;--red:#ff4d4d;--amber:#ffb020;--green:#3ddc84;}
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap');
+:root{--cyan:#0891B2;--cyandark:#0E7490;--deep:#155E75;--tint:#EFF7F9;--ink:#122A33;
+--line:#C9DDE3;--soft:#DFEBEF;--mut:#4C6B76;--red:#B42318;--redtint:#FCF1EF;
+--amber:#B45309;--green:#15803D;}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--ink);font:14px/1.45 "Segoe UI",system-ui,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:10px 18px;
-border-bottom:2px solid var(--cyan);background:var(--panel)}
-header .tag{background:var(--cyan);color:#04252b;font-weight:700;letter-spacing:.18em;
-padding:3px 10px;font-size:11px;text-transform:uppercase;border-radius:2px}
-header h1{font-size:15px;letter-spacing:.12em;text-transform:uppercase;font-weight:600}
-header .right{margin-left:auto;display:flex;gap:10px;align-items:center}
+body{background:#FFFFFF;color:var(--ink);
+font:14px/1.5 "Barlow","Segoe UI",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:#fff;
+border-top:6px solid var(--deep);border-bottom:1px solid var(--line)}
+header .tag{background:var(--deep);color:#fff;font-weight:600;letter-spacing:.22em;
+padding:3px 12px;font-size:11px;text-transform:uppercase;border-radius:2px;
+font-family:"Barlow Condensed","Segoe UI",sans-serif}
+header h1{font-size:17px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;
+color:var(--ink);font-family:"Barlow Condensed","Segoe UI",sans-serif}
+header .right{margin-left:auto;display:flex;gap:10px;align-items:center;
+color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--red);display:inline-block}
 .dot.ok{background:var(--green)}
 main{display:grid;grid-template-columns:minmax(0,2.2fr) minmax(280px,1fr);
 gap:14px;padding:14px 18px;max-width:1500px;margin:0 auto}
 @media(max-width:900px){main{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
-.panel h2{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut);
-padding:9px 12px;border-bottom:1px solid var(--line)}
-#viewwrap{position:relative}
+.panel{background:#fff;border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.panel h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--deep);
+padding:10px 12px;border-bottom:1px solid var(--line);font-weight:600;
+font-family:"Barlow Condensed","Segoe UI",sans-serif}
+.panel h2::before{content:"";display:inline-block;width:9px;height:9px;
+background:var(--cyan);margin-right:8px}
 #view{width:100%;display:block;background:#000;min-height:280px}
-#banner{position:absolute;left:0;right:0;top:0;background:rgba(200,20,20,.92);
+#banner{position:absolute;left:0;right:0;top:0;background:rgba(180,35,24,.94);
 color:#fff;text-align:center;font-weight:700;letter-spacing:.14em;padding:10px;
-font-size:16px;display:none;text-transform:uppercase}
+font-size:16px;display:none;text-transform:uppercase;z-index:2}
 #banner.on{display:block;animation:blink 1s steps(2) infinite}
-@keyframes blink{50%{background:rgba(120,0,0,.92)}}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line)}
-.stat{background:var(--panel);padding:10px 12px}
-.stat .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+@keyframes blink{50%{background:rgba(120,10,5,.94)}}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
+border-top:1px solid var(--line)}
+.stat{background:#fff;padding:10px 12px;border-top:3px solid var(--cyan)}
+.stat:nth-child(3){border-top-color:var(--red);background:var(--redtint)}
+.stat:nth-child(3) .v{color:var(--red)}
+.stat .v{font-size:22px;font-weight:700;color:var(--deep);
+font-family:"Barlow Condensed","Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
 .stat .l{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut)}
 .hz{display:flex;flex-direction:column;gap:8px;padding:12px}
-.hzrow{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);
-border-radius:3px;background:#0f1a20}
-.hzrow.active{border-color:var(--red);background:#2a1214}
-.hzrow .n{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
-.hzrow .k{font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+.hzrow{display:flex;align-items:center;gap:10px;padding:8px 10px;
+border:1px solid var(--line);border-radius:2px;background:#fff}
+.hzrow.active{border-color:var(--red);background:var(--redtint)}
+.hzrow .n{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums;
+color:var(--deep)}
+.hzrow.active .n{color:var(--red)}
+.hzrow .k{font-size:12px;text-transform:uppercase;letter-spacing:.08em;
+color:var(--deep);font-weight:600}
 .hzrow .d{font-size:11px;color:var(--mut)}
 #log{list-style:none;max-height:260px;overflow-y:auto;padding:6px 12px;font-size:12px}
-#log li{padding:5px 0;border-bottom:1px dashed var(--line);color:var(--mut)}
+#log li{padding:5px 0;border-bottom:1px dashed var(--soft);color:var(--mut)}
 #log li b{color:var(--red)}
 .foot{display:flex;gap:10px;align-items:center;padding:10px 12px;flex-wrap:wrap}
-button{background:transparent;border:1px solid var(--cyan);color:var(--cyan);
-padding:7px 14px;border-radius:3px;cursor:pointer;font-size:12px;
-letter-spacing:.1em;text-transform:uppercase}
-button:hover{background:rgba(34,184,207,.12)}
+button{background:transparent;border:1px solid var(--cyan);color:var(--deep);
+padding:8px 14px;border-radius:2px;cursor:pointer;font-size:12px;
+letter-spacing:.12em;text-transform:uppercase;font-weight:600;
+font-family:"Barlow Condensed","Segoe UI",sans-serif}
+button:hover{background:var(--tint);border-color:var(--cyandark)}
 button.mute.off{border-color:var(--mut);color:var(--mut)}
+#reportbtn{background:var(--cyan);color:#fff;border-color:var(--cyandark)}
+#reportbtn:hover{background:var(--cyandark)}
 #spark{font-size:11px;color:var(--mut)}
 #report,#livereport{white-space:pre-wrap;font:12px/1.5 Consolas,monospace;padding:12px;
-display:none;max-height:340px;overflow-y:auto;border-top:1px solid var(--line)}
+display:none;max-height:340px;overflow-y:auto;border-top:1px solid var(--line);
+background:#fff;color:var(--ink)}
 #livereport::before{content:"LIVE SAFETY REPORT (auto-updated on alerts)";display:block;
-color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-size:11px}
+color:var(--deep);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-size:11px}
 #incidents{list-style:none;max-height:200px;overflow-y:auto;padding:6px 12px;font-size:12px}
-#incidents li{padding:6px 0;border-bottom:1px dashed var(--line)}
+#incidents li{padding:6px 0;border-bottom:1px dashed var(--soft)}
 #incidents li b{color:var(--amber)}
 #incidents li span{color:var(--mut)}
-#srcin{flex:1;min-width:170px;background:#0f1a20;border:1px solid var(--line);
-color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
-#srcnow{font-size:11px;color:var(--mut);width:100%}
-#viewwrap{margin:12px;border-radius:14px;overflow:hidden;background:#000}
+#viewwrap{position:relative;margin:12px;border-radius:10px;overflow:hidden;
+background:#0d1418;border:1px solid var(--line)}
 #viewtag{position:absolute;right:12px;top:12px;background:rgba(0,0,0,.65);
 color:#fff;font-size:10px;letter-spacing:.16em;padding:3px 9px;border-radius:999px}
 #namechip{position:absolute;left:14px;top:12px;color:#fff;font-size:13px;
@@ -870,16 +887,17 @@ letter-spacing:0;text-transform:none}
 .circ.off{background:#d93025;border-color:#d93025}
 #pills{display:flex;gap:10px;padding:2px 14px 12px;flex-wrap:wrap;align-items:center;
 justify-content:center}
-.pill{background:#0f1a20;border:1px solid var(--line);color:var(--ink);
-border-radius:999px;padding:9px 16px;font-size:12px;cursor:pointer;
-letter-spacing:0;text-transform:none}
-select.pill{appearance:none;-webkit-appearance:none;padding-right:22px;
+.pill{background:#fff;border:1px solid var(--line);color:var(--ink);
+border-radius:999px;padding:9px 16px;font-size:12.5px;cursor:pointer;
+letter-spacing:0;text-transform:none;font-family:"Barlow","Segoe UI",sans-serif;
+font-weight:500}
+select.pill{appearance:none;-webkit-appearance:none;padding-right:26px;
 background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),
 linear-gradient(135deg,var(--mut) 50%,transparent 50%);
-background-position:calc(100% - 14px) 55%,calc(100% - 10px) 55%;
-background-size:4px 4px;background-repeat:no-repeat;max-width:260px}
+background-position:calc(100% - 16px) 55%,calc(100% - 12px) 55%;
+background-size:4px 4px;background-repeat:no-repeat;max-width:280px}
 input.pill{cursor:text;min-width:180px;flex:1}
-button.pill:hover,select.pill:hover{border-color:var(--cyan)}
+button.pill:hover,select.pill:hover{border-color:var(--cyan);background:var(--tint)}
 #srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
 #autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
 cursor:pointer}
@@ -941,10 +959,11 @@ cursor:pointer}
     <ul id="log"><li>No alerts yet.</li></ul>
     <h2>On-the-spot AI analysis</h2>
     <ul id="incidents"><li>Scene notes appear here seconds after an alert fires.</li></ul>
+    <h2>Safety report</h2>
     <div class="foot">
+      <button id="reportbtn">Generate report</button>
       <label id="autolbl"><input type="checkbox" id="autooff" checked>
         auto-off camera when everyone closes</label>
-      <button id="reportbtn">Generate report</button>
       <span id="spark">Spark: checking…</span>
     </div>
     <div id="livereport"></div>
