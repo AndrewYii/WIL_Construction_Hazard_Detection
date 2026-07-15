@@ -96,15 +96,14 @@ def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
     return cams
 
 
-def camera_off_frame(shape=(360, 640, 3)):
-    """Placeholder pushed to the streams when the camera is toggled off, so
-    viewers see an explicit OFF state instead of a frozen last frame."""
+def camera_off_frame(text: str = "CAMERA OFF", shape=(360, 640, 3)):
+    """Placeholder pushed to the streams when the camera is off, so viewers
+    see an explicit OFF state instead of a frozen last frame."""
     import numpy as np
     frame = np.zeros(shape, dtype=np.uint8)
     h, w = shape[:2]
-    text = "CAMERA OFF"
-    (tw, th), _ = cv2.getTextSize(text, FONT, 1.1, 2)
-    cv2.putText(frame, text, ((w - tw) // 2, (h + th) // 2), FONT, 1.1,
+    (tw, th), _ = cv2.getTextSize(text, FONT, 0.9, 2)
+    cv2.putText(frame, text, (max((w - tw) // 2, 10), (h + th) // 2), FONT, 0.9,
                 (120, 120, 120), 2)
     return frame
 
@@ -161,8 +160,23 @@ class CaptureThread(threading.Thread):
         self.close_on_exit = True
 
     def run(self):
-        cap = cv2.VideoCapture(self.source)
-        if not cap.isOpened():
+        import platform
+        # match the backend used when enumerating cameras, or Windows index
+        # numbers won't line up (MSMF and DSHOW order devices differently)
+        backend = (cv2.CAP_DSHOW
+                   if platform.system() == "Windows" and isinstance(self.source, int)
+                   else cv2.CAP_ANY)
+        cap = None
+        for _ in range(6):  # a just-released device can take a moment to free
+            if self.stop_flag.is_set():
+                return
+            cap = cv2.VideoCapture(self.source, backend)
+            if cap.isOpened():
+                break
+            cap.release()
+            cap = None
+            time.sleep(0.5)
+        if cap is None:
             print(f"[capture] ERROR: cannot open source {self.source!r}")
             if self.close_on_exit:
                 self.slot.close()
@@ -176,6 +190,8 @@ class CaptureThread(threading.Thread):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 break
+            if self.stop_flag.is_set():
+                break  # don't overwrite the CAMERA OFF placeholder on shutdown
             self.slot.put(frame)
             if delay:  # pace file playback at native FPS
                 time.sleep(delay)
@@ -229,6 +245,14 @@ class SourceManager:
             self.camera_on = True
             self._loop_file = loop_file
             return True
+
+    def arm(self, source, loop_file: bool = False):
+        """Remember the source without opening the device (standby): the
+        camera stays off until someone presses the camera button."""
+        with self._lock:
+            self.current = source
+            self._loop_file = loop_file
+            self.camera_on = False
 
     def set_camera(self, on: bool):
         """Meeting-style camera toggle: off releases the device entirely
@@ -749,10 +773,20 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 on = qs["on"][0] == "1"
                 sources.set_camera(on)
                 if not on:
-                    placeholder = camera_off_frame()
-                    if raw_slot is not None:
-                        raw_slot.put(placeholder.copy())
-                    out_slot.put(placeholder)
+                    with state.lock:  # no camera, no live hazards
+                        state.active_hazards = []
+                        state.workers_now = state.vehicles_now = 0
+                    def push_off():
+                        if sources.camera_on:
+                            return
+                        placeholder = camera_off_frame()
+                        if raw_slot is not None:
+                            raw_slot.put(placeholder.copy())
+                        out_slot.put(placeholder)
+                    push_off()
+                    # the dying capture thread may land one final frame after
+                    # our placeholder — repaint it once things settle
+                    threading.Timer(0.8, push_off).start()
                 print(f"[live] camera {'ON' if on else 'OFF'}")
             if "auto" in qs:
                 with state.lock:
@@ -1000,6 +1034,20 @@ color:var(--ink);font:inherit;padding:8px 6px 8px 0;min-width:0}
 .pillwrap select{cursor:pointer;max-width:230px}
 .pillwrap.grow{flex:1;min-width:190px}
 .pillwrap.grow input{flex:1;width:100%}
+.dd{position:relative;cursor:pointer;user-select:none;padding-right:12px}
+.ddlabel{padding:9px 0;max-width:230px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.dd .chev{width:13px;height:13px}
+.menu{position:absolute;top:calc(100% + 6px);left:0;min-width:100%;
+background:#fff;border:1px solid var(--line);border-radius:12px;
+box-shadow:0 10px 28px rgba(18,42,51,.14);list-style:none;padding:6px;
+display:none;z-index:30;max-height:230px;overflow-y:auto;white-space:nowrap}
+.dd.open .menu{display:block}
+.dd.open{border-color:var(--cyan)}
+.menu li{padding:9px 13px;border-radius:7px;font-size:12.5px;color:var(--ink)}
+.menu li:hover{background:var(--tint)}
+.menu li.sel{color:var(--deep);font-weight:600;background:var(--tint)}
+.menu li.none{color:var(--mut);cursor:default}
 .pillwrap:focus-within,.pillwrap:hover,button.pill:hover{border-color:var(--cyan);
 background:var(--tint)}
 .iconbtn{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);
@@ -1054,20 +1102,24 @@ cursor:pointer}
       </div>
     </div>
     <div id="pills">
-      <label class="pillwrap" title="Camera device">
+      <div class="pillwrap dd" id="camdd" title="Camera device">
         <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-        <select id="camsel"><option value="">scanning cameras…</option></select>
-      </label>
+        <span class="ddlabel" id="camlabel">scanning cameras…</span>
+        <svg class="chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        <ul class="menu" id="cammenu"></ul>
+      </div>
       <button class="iconbtn" id="rescan" title="Rescan for new cameras">
         <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
       </button>
-      <label class="pillwrap" title="View">
+      <div class="pillwrap dd" id="viewdd" title="View">
         <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-        <select id="viewsel">
-          <option value="/stream.mjpg" data-tag="ANNOTATED">Annotated view</option>
-          <option value="/raw.mjpg" data-tag="DIRECT">Direct view</option>
-        </select>
-      </label>
+        <span class="ddlabel" id="viewlabel">Annotated view</span>
+        <svg class="chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+        <ul class="menu" id="viewmenu">
+          <li data-v="/stream.mjpg" data-tag="ANNOTATED" class="sel">Annotated view</li>
+          <li data-v="/raw.mjpg" data-tag="DIRECT">Direct view</li>
+        </ul>
+      </div>
       <button class="pill" id="upbtn" title="Run detection on a video file (loops)">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         Upload video</button>
@@ -1193,7 +1245,8 @@ async function poll(){
       const label=cam?cam.label:(digit?'Camera '+d.source
         :d.source.split(/[\\/]/).pop());
       $('namechip').textContent=(d.camera_on?'':'OFF · ')+label;
-      if(digit&&document.activeElement!==$('camsel'))$('camsel').value=d.source;
+      if(digit&&camSelected!==d.source&&!$('camdd').classList.contains('open')){
+        camSelected=d.source;renderCamMenu();}
       if(!$('srcnow').textContent.startsWith('Switching'))
         $('srcnow').textContent=(d.camera_on?'live':'camera off')
           +'  ·  viewers: '+d.viewers;}
@@ -1222,28 +1275,51 @@ async function switchSrc(v){
   try{const r=await fetch('/switch?src='+encodeURIComponent(v));const d=await r.json();
     $('srcnow').textContent='Current source: '+d.source;}
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
+let camSelected='';
+function renderCamMenu(){
+  const menu=$('cammenu');menu.innerHTML='';
+  camList.forEach(c=>{const li=document.createElement('li');
+    li.dataset.i=String(c.index);li.textContent=c.label;
+    if(String(c.index)===camSelected)li.classList.add('sel');
+    menu.appendChild(li);});
+  if(!camList.length){const li=document.createElement('li');
+    li.className='none';li.textContent='no camera found — plug one in';
+    menu.appendChild(li);}
+  const cur=camList.find(c=>String(c.index)===camSelected);
+  if(cur)$('camlabel').textContent=cur.label;
+  else if(!camList.length)$('camlabel').textContent='no camera found';}
 async function loadCams(refresh){
   if(refresh)$('rescan').classList.add('spin');
   try{const r=await fetch('/cameras'+(refresh?'?refresh=1':''));
     const fresh=await r.json();
-    // announce newly plugged devices (e.g. RealSense connected mid-session)
     if(camList.length){
       const known=new Set(camList.map(c=>c.index));
       fresh.filter(c=>!known.has(c.index)).forEach(c=>{
-        $('srcnow').textContent='New camera detected: '+c.label;
-        say('New camera detected: '+c.label,true);});}
-    camList=fresh;
-    const sel=$('camsel');const prev=sel.value;sel.innerHTML='';
-    camList.forEach(c=>{const o=document.createElement('option');
-      o.value=String(c.index);o.textContent=c.label;sel.appendChild(o);});
-    if(!camList.length){const o=document.createElement('option');
-      o.value='';o.textContent='no local camera found';sel.appendChild(o);}
-    if(prev&&[...sel.options].some(o=>o.value===prev))sel.value=prev;
+        $('srcnow').textContent='New camera detected: '+c.label;});}
+    camList=fresh;renderCamMenu();
   }catch(e){}
   $('rescan').classList.remove('spin');}
 loadCams();
 setInterval(()=>loadCams(true),20000); // auto-detect newly plugged cameras
-$('rescan').onclick=()=>loadCams(true);
+$('rescan').onclick=e=>{e.stopPropagation();loadCams(true);};
+// custom dropdowns (native <select> popups can't be styled)
+document.querySelectorAll('.dd').forEach(el=>{
+  el.addEventListener('click',e=>{
+    const li=e.target.closest('li');
+    if(li&&!li.classList.contains('none')){
+      el.classList.remove('open');
+      if(el.id==='camdd'){camSelected=li.dataset.i;renderCamMenu();
+        switchSrc(li.dataset.i);}
+      else{$('view').src=li.dataset.v;$('viewtag').textContent=li.dataset.tag;
+        $('viewlabel').textContent=li.textContent;
+        el.querySelectorAll('li').forEach(x=>x.classList.remove('sel'));
+        li.classList.add('sel');}
+      return;}
+    document.querySelectorAll('.dd.open').forEach(d=>{if(d!==el)d.classList.remove('open');});
+    el.classList.toggle('open');});});
+document.addEventListener('click',e=>{
+  if(!e.target.closest('.dd'))
+    document.querySelectorAll('.dd.open').forEach(d=>d.classList.remove('open'));});
 $('upbtn').onclick=()=>$('upfile').click();
 $('upfile').onchange=()=>{
   const f=$('upfile').files[0];if(!f)return;
@@ -1257,11 +1333,6 @@ $('upfile').onchange=()=>{
   $('srcnow').textContent='Uploading '+f.name+' …';
   xhr.send(f);
   $('upfile').value='';};
-$('camsel').onchange=()=>{if($('camsel').value!=='')switchSrc($('camsel').value);};
-$('viewsel').onchange=()=>{
-  const o=$('viewsel').selectedOptions[0];
-  $('view').src=o.value;
-  $('viewtag').textContent=o.dataset.tag;};
 $('cambtn').onclick=async()=>{
   try{const r=await fetch('/camera?on='+(camOn?0:1));const d=await r.json();
     camOn=d.camera_on;
@@ -1305,6 +1376,10 @@ def parse_args():
                    help="Disable server-side speaker output")
     p.add_argument("--no-analysis", action="store_true",
                    help="Disable on-the-spot VLM/LLM incident analysis")
+    p.add_argument("--autostart", action="store_true",
+                   help="Open the camera immediately (unattended/server mode). "
+                        "Default: start in standby — the camera stays off until "
+                        "someone presses the camera button on the dashboard.")
     p.add_argument("--height-zone", action="store_true",
                    default=config.HEIGHT_ZONE_ENABLED,
                    help="Enable experimental height-hazard heuristic")
@@ -1328,7 +1403,16 @@ def main():
     source = args.video if args.video else parse_source(args.source)
     in_slot, out_slot, raw_slot = LatestFrame(), LatestFrame(), LatestFrame()
     sources = SourceManager(in_slot)
-    sources.start(source, loop_file=bool(args.video), critical=True)
+    if args.video or args.autostart:
+        sources.start(source, loop_file=bool(args.video), critical=True)
+    else:
+        # meeting-style standby: nothing is captured until a user consents by
+        # pressing the camera button on the dashboard
+        sources.arm(source)
+        standby = camera_off_frame("CAMERA OFF - press the camera button")
+        raw_slot.put(standby.copy())
+        out_slot.put(standby)
+        print("[live] standby: camera stays OFF until turned on from the dashboard")
 
     threading.Thread(target=spark_status_poller, args=(state,), daemon=True).start()
 

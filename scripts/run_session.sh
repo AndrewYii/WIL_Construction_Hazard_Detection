@@ -26,7 +26,7 @@ fi
 PY=venv/bin/python
 [ -x "$PY" ] || PY=python3
 
-ARGS="${*:---weights runs/detect/plan_a_yolov8/weights/best.pt --headless --port 8090}"
+ARGS="${*:---weights runs/detect/plan_a_yolov8/weights/best.pt --headless --port 8090 --autostart}"
 
 tmux new-session -d -s "$SESSION" \
     "$PY app/live.py $ARGS 2>&1 | tee '$LOG'"
