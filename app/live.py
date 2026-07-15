@@ -567,6 +567,24 @@ def detection_loop(args, detector, in_slot: LatestFrame,
 # HTTP server (headless mode)
 # --------------------------------------------------------------------------
 
+PWA_MANIFEST = json.dumps({
+    "name": "Site Safety Monitor",
+    "short_name": "SiteGuard",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0d1418",
+    "theme_color": "#0d1418",
+    "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}],
+})
+
+PWA_ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<rect width="100" height="100" rx="18" fill="#0d1418"/>'
+            '<text x="50" y="68" font-size="52" text-anchor="middle">🚧</text></svg>')
+
+# minimal fetch handler makes the app installable when served over HTTPS
+PWA_SW = "self.addEventListener('fetch',()=>{});"
+
+
 def make_handler(out_slot: LatestFrame, state: SessionState,
                  sources: "SourceManager", raw_slot: LatestFrame | None = None):
     dashboard = DASHBOARD_HTML
@@ -600,6 +618,12 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self.wfile.write(body)
             elif self.path.startswith("/switch"):
                 self._switch()
+            elif self.path == "/manifest.json":
+                self._static(PWA_MANIFEST, "application/manifest+json")
+            elif self.path == "/icon.svg":
+                self._static(PWA_ICON, "image/svg+xml")
+            elif self.path == "/sw.js":
+                self._static(PWA_SW, "text/javascript")
             elif self.path.startswith("/cameras"):
                 current = sources.current if isinstance(sources.current, int) else None
                 body = json.dumps(list_local_cameras(current)).encode()
@@ -614,6 +638,14 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self._report()
             else:
                 self.send_error(404)
+
+        def _static(self, text: str, content_type: str):
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _camera(self):
             from urllib.parse import parse_qs, urlparse
@@ -758,6 +790,12 @@ DASHBOARD_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Site Safety Monitor — Live</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg">
+<meta name="theme-color" content="#0d1418">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
 :root{--bg:#0d1418;--panel:#132027;--line:#1f3540;--ink:#e8f1f4;--mut:#7fa0ac;
 --cyan:#22b8cf;--red:#ff4d4d;--amber:#ffb020;--green:#3ddc84;}
@@ -1026,6 +1064,7 @@ $('reportbtn').onclick=async()=>{
   try{const r=await fetch('/report');box.textContent=await r.text();}
   catch(e){box.textContent='Report request failed: '+e;}};
 setInterval(poll,1000);poll();
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
 </body></html>
 """

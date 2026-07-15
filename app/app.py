@@ -116,27 +116,23 @@ def _render_realtime(right):
             cams.append({"index": used, "label": f"Camera {used} (in use by monitor)"})
             cams.sort(key=lambda c: c["index"])
 
-    options = [c["label"] for c in cams] + ["Phone / IP camera (URL)"]
+    options = [c["label"] for c in cams]
     pick_col, rescan_col = st.columns([5, 1], vertical_alignment="bottom")
-    cam = pick_col.selectbox("Camera", options,
-                             help="Local cameras detected on this machine, "
-                                  "like a meeting app's device picker.")
+    cam = pick_col.selectbox("Camera", options if options else ["No camera found"],
+                             disabled=not options,
+                             help="Cameras detected on this machine, like a "
+                                  "meeting app's device picker.")
     if rescan_col.button(":material/refresh:", help="Rescan cameras",
                          width="stretch"):
         list_cameras.clear()
         st.rerun()
     if not cams:
-        st.warning("No local camera detected — plug one in and rescan, "
-                   "or use a phone / IP camera URL.")
-
-    if cam == "Phone / IP camera (URL)":
-        src = st.text_input("Stream URL",
-                            placeholder="http://192.168.0.5:8080/video").strip()
-    else:
-        src = str(cams[options.index(cam)]["index"])
+        st.warning("No camera detected — plug one in and rescan.")
+    src = str(cams[options.index(cam)]["index"]) if options else ""
     if not running:
         if st.button("Start real-time monitor", type="primary",
                      width="stretch", disabled=not src):
+            time.sleep(1.2)  # let any in-flight preview grab release the device
             subprocess.Popen(
                 [sys.executable, str(PROJECT_ROOT / "app" / "live.py"),
                  "--headless", "--port", str(port), "--source", src],
@@ -195,8 +191,31 @@ def _render_realtime(right):
                           f"http://{host}:{port}", width="stretch")
         right.caption("The dashboard adds browser voice alerts, hazard counters, "
                       "the alert log, camera tiles, and the live LLM report.")
+    elif src:
+        # green-room preview: grab a frame from the chosen camera every few
+        # seconds so you can see what it captures before starting detection
+        with right:
+            @st.fragment(run_every="2.5s")
+            def _greenroom():
+                import platform
+
+                import cv2
+                backend = (cv2.CAP_DSHOW if platform.system() == "Windows"
+                           else cv2.CAP_ANY)
+                cap = cv2.VideoCapture(int(src), backend)
+                ok, frame = cap.read() if cap.isOpened() else (False, None)
+                cap.release()
+                if ok:
+                    st.image(frame[:, :, ::-1], caption=f"Camera preview — {cam}",
+                             width="stretch")
+                else:
+                    st.caption("Preview unavailable — camera busy or starting up.")
+
+            _greenroom()
+        right.info("This is the live camera preview. Start the monitor to "
+                   "begin detection and alerts.")
     else:
-        right.info("Start the monitor to see the live stream here.")
+        right.info("Pick a camera to see its preview here.")
 
 st.set_page_config(page_title="Construction Hazard Detection", page_icon="🚧", layout="wide")
 
