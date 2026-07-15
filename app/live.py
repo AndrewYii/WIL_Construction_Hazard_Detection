@@ -51,6 +51,51 @@ HAZARD_LABELS = {
 }
 
 
+_CAM_CACHE = {"t": 0.0, "list": []}
+
+
+def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
+    """Meet-style device list: probe OpenCV indices, pair with OS device
+    names (Windows PnP / Linux v4l2). The index currently held open by the
+    monitor can't be probed, so it is kept and marked active. Cached 60s."""
+    import platform
+    now = time.time()
+    if now - _CAM_CACHE["t"] < 60 and _CAM_CACHE["list"]:
+        return _CAM_CACHE["list"]
+    names = []
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import subprocess
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_PnPEntity | Where-Object "
+                 "{$_.PNPClass -in 'Camera','Image'} | "
+                 "Select-Object -ExpandProperty Name"],
+                capture_output=True, text=True, timeout=10).stdout
+            names = [line.strip() for line in out.splitlines() if line.strip()]
+        else:
+            import glob
+            for path in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+                with open(path) as f:
+                    names.append(f.read().strip())
+    except Exception:
+        pass
+    backend = cv2.CAP_DSHOW if system == "Windows" else cv2.CAP_ANY
+    cams = []
+    for i in range(max_probe):
+        label = names[i] if i < len(names) else f"Camera {i}"
+        if current is not None and i == current:
+            cams.append({"index": i, "label": label})
+            continue
+        cap = cv2.VideoCapture(i, backend)
+        if cap.isOpened():
+            cams.append({"index": i, "label": label})
+        cap.release()
+    _CAM_CACHE.update(t=now, list=cams)
+    return cams
+
+
 def camera_off_frame(shape=(360, 640, 3)):
     """Placeholder pushed to the streams when the camera is toggled off, so
     viewers see an explicit OFF state instead of a frozen last frame."""
@@ -380,13 +425,14 @@ def spark_status_poller(state: SessionState, interval: float = 30.0):
 # --------------------------------------------------------------------------
 
 def _draw_subtitle(frame, text):
-    """Broadcast-style caption bar at the bottom of the frame — readable on a
-    phone screen and preserved in any recording of the stream."""
+    """Broadcast-style caption bar near the bottom of the frame — raised so
+    the dashboard's floating camera controls never cover it, readable on a
+    phone screen, and preserved in any recording of the stream."""
     h, w = frame.shape[:2]
     scale = max(0.55, min(w / 1100, 1.0))
     (tw, th), _ = cv2.getTextSize(text, FONT, scale, 2)
     x = max((w - tw) // 2, 8)
-    y = h - 18
+    y = h - max(int(h * 0.16), 60)
     cv2.rectangle(frame, (x - 14, y - th - 12), (x + tw + 14, y + 10), (20, 20, 190), -1)
     cv2.putText(frame, text, (x, y), FONT, scale, (255, 255, 255), 2)
 
@@ -554,6 +600,14 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self.wfile.write(body)
             elif self.path.startswith("/switch"):
                 self._switch()
+            elif self.path.startswith("/cameras"):
+                current = sources.current if isinstance(sources.current, int) else None
+                body = json.dumps(list_local_cameras(current)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path.startswith("/camera"):
                 self._camera()
             elif self.path.startswith("/report"):
@@ -762,19 +816,33 @@ color:var(--cyan);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-si
 #srcin{flex:1;min-width:170px;background:#0f1a20;border:1px solid var(--line);
 color:var(--ink);padding:7px 10px;border-radius:3px;font-size:12px}
 #srcnow{font-size:11px;color:var(--mut);width:100%}
-#viewtag{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.65);
-color:#fff;font-size:10px;letter-spacing:.16em;padding:3px 9px;border-radius:2px}
-#tiles{display:flex;gap:8px;padding:10px;background:#0a1013;overflow-x:auto}
-.tile{position:relative;flex:0 0 auto;width:118px;height:68px;border:2px solid var(--line);
-border-radius:4px;overflow:hidden;cursor:pointer;background:#10181d;
-display:flex;align-items:center;justify-content:center}
-.tile img{width:100%;height:100%;object-fit:cover;display:block}
-.tile span{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);
-color:#dfe9ec;font-size:10px;letter-spacing:.08em;text-align:center;padding:2px 0}
-.tile.cam span{position:static;background:none;font-size:11px}
-.tile.active{border-color:var(--cyan)}
-.tile:hover{border-color:var(--amber)}
-#cambtn.off{border-color:var(--red);color:var(--red)}
+#viewwrap{margin:12px;border-radius:14px;overflow:hidden;background:#000}
+#viewtag{position:absolute;right:12px;top:12px;background:rgba(0,0,0,.65);
+color:#fff;font-size:10px;letter-spacing:.16em;padding:3px 9px;border-radius:999px}
+#namechip{position:absolute;left:14px;top:12px;color:#fff;font-size:13px;
+text-shadow:0 1px 3px rgba(0,0,0,.9);max-width:55%;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+#vidctl{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
+display:flex;gap:14px;z-index:3}
+.circ{width:48px;height:48px;border-radius:50%;border:1px solid rgba(255,255,255,.35);
+background:rgba(25,34,40,.85);color:#fff;font-size:19px;cursor:pointer;
+display:flex;align-items:center;justify-content:center;padding:0;
+letter-spacing:0;text-transform:none}
+.circ:hover{background:rgba(45,60,68,.95)}
+.circ.off{background:#d93025;border-color:#d93025}
+#pills{display:flex;gap:10px;padding:2px 14px 12px;flex-wrap:wrap;align-items:center;
+justify-content:center}
+.pill{background:#0f1a20;border:1px solid var(--line);color:var(--ink);
+border-radius:999px;padding:9px 16px;font-size:12px;cursor:pointer;
+letter-spacing:0;text-transform:none}
+select.pill{appearance:none;-webkit-appearance:none;padding-right:22px;
+background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),
+linear-gradient(135deg,var(--mut) 50%,transparent 50%);
+background-position:calc(100% - 14px) 55%,calc(100% - 10px) 55%;
+background-size:4px 4px;background-repeat:no-repeat;max-width:260px}
+input.pill{cursor:text;min-width:180px;flex:1}
+button.pill:hover,select.pill:hover{border-color:var(--cyan)}
+#srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
 #autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
 cursor:pointer}
 #autolbl input{accent-color:var(--cyan)}
@@ -792,16 +860,24 @@ cursor:pointer}
     <div id="viewwrap">
       <div id="banner">HAZARD</div>
       <img id="view" src="/stream.mjpg" alt="live stream">
+      <span id="namechip">Site camera</span>
       <span id="viewtag">ANNOTATED</span>
+      <div id="vidctl">
+        <button class="circ" id="cambtn" title="Turn camera on/off">🎥</button>
+        <button class="circ" id="mutebtn" title="Voice alerts on/off">🔊</button>
+      </div>
     </div>
-    <div id="tiles">
-      <div class="tile active" data-view="/stream.mjpg" data-tag="ANNOTATED">
-        <img src="/stream.mjpg" alt=""><span>Annotated</span></div>
-      <div class="tile" data-view="/raw.mjpg" data-tag="DIRECT">
-        <img src="/raw.mjpg" alt=""><span>Direct</span></div>
-      <div class="tile cam" data-src="0"><span>📷 Webcam 0</span></div>
-      <div class="tile cam" data-src="1"><span>📷 RealSense</span></div>
-      <div class="tile cam" id="phonetile"><span>📱 Phone cam</span></div>
+    <div id="pills">
+      <select id="camsel" class="pill" title="Camera device">
+        <option value="">📷 scanning cameras…</option>
+      </select>
+      <select id="viewsel" class="pill" title="View">
+        <option value="/stream.mjpg" data-tag="ANNOTATED">🖼 Annotated view</option>
+        <option value="/raw.mjpg" data-tag="DIRECT">🎬 Direct view</option>
+      </select>
+      <input id="srcin" class="pill" placeholder="📱 phone / IP camera URL">
+      <button id="srcgo" class="pill">Connect</button>
+      <span id="srcnow"></span>
     </div>
     <div class="stats">
       <div class="stat"><div class="v" id="workers">0</div><div class="l">Workers</div></div>
@@ -827,19 +903,9 @@ cursor:pointer}
     <ul id="log"><li>No alerts yet.</li></ul>
     <h2>On-the-spot AI analysis</h2>
     <ul id="incidents"><li>Scene notes appear here seconds after an alert fires.</li></ul>
-    <h2>Camera source</h2>
-    <div class="foot" id="srcbar">
-      <button class="srcbtn" data-src="0">Webcam 0</button>
-      <button class="srcbtn" data-src="1">RealSense / Cam 1</button>
-      <input id="srcin" placeholder="phone URL e.g. http://192.168.0.5:8080/video">
-      <button id="srcgo">Switch</button>
-      <span id="srcnow"></span>
-    </div>
     <div class="foot">
-      <button id="cambtn">🎥 Camera on</button>
       <label id="autolbl"><input type="checkbox" id="autooff" checked>
         auto-off camera when everyone closes</label>
-      <button class="mute" id="mutebtn">🔊 Voice on</button>
       <button id="reportbtn">Generate report</button>
       <span id="spark">Spark: checking…</span>
     </div>
@@ -848,10 +914,10 @@ cursor:pointer}
   </section>
 </main>
 <script>
-let muted=false,lastAlert=0,alertTotal=0,camOn=true;
+let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[];
 const $=id=>document.getElementById(id);
 $('mutebtn').onclick=()=>{muted=!muted;
-  $('mutebtn').textContent=muted?'🔇 Voice off':'🔊 Voice on';
+  $('mutebtn').textContent=muted?'🔇':'🔊';
   $('mutebtn').classList.toggle('off',muted);
   if(!muted)say('Voice alerts enabled');};
 function say(text){
@@ -899,12 +965,19 @@ async function poll(){
                      +(n.note||'');
         inc.appendChild(li);});
     }
-    if(d.source!==undefined&&!$('srcnow').textContent.startsWith('Switching'))
-      $('srcnow').textContent='Current source: '+d.source
-        +(d.camera_on?'':'  (camera off)')+'  ·  viewers: '+d.viewers;
+    if(d.source!==undefined){
+      const digit=/^[0-9]+$/.test(d.source);
+      const cam=digit?camList.find(c=>String(c.index)===d.source):null;
+      const label=cam?cam.label:(digit?'Camera '+d.source
+        :d.source.split(/[\\/]/).pop());
+      $('namechip').textContent=(d.camera_on?'':'🚫 ')+label;
+      if(digit&&document.activeElement!==$('camsel'))$('camsel').value=d.source;
+      if(!$('srcnow').textContent.startsWith('Switching'))
+        $('srcnow').textContent=(d.camera_on?'live':'camera off')
+          +'  ·  viewers: '+d.viewers;}
     if(d.camera_on!==undefined){
       camOn=d.camera_on;
-      $('cambtn').textContent=camOn?'🎥 Camera on':'🚫 Camera off';
+      $('cambtn').textContent=camOn?'🎥':'🚫';
       $('cambtn').classList.toggle('off',!camOn);}
     if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
       $('autooff').checked=d.auto_off;
@@ -925,23 +998,25 @@ async function switchSrc(v){
   try{const r=await fetch('/switch?src='+encodeURIComponent(v));const d=await r.json();
     $('srcnow').textContent='Current source: '+d.source;}
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
-document.querySelectorAll('.srcbtn').forEach(b=>b.onclick=()=>switchSrc(b.dataset.src));
 $('srcgo').onclick=()=>switchSrc($('srcin').value.trim());
-document.querySelectorAll('.tile[data-view]').forEach(t=>t.onclick=()=>{
-  $('view').src=t.dataset.view;
-  $('viewtag').textContent=t.dataset.tag;
-  document.querySelectorAll('.tile[data-view]').forEach(x=>x.classList.remove('active'));
-  t.classList.add('active');});
-document.querySelectorAll('.tile.cam[data-src]').forEach(t=>t.onclick=()=>switchSrc(t.dataset.src));
-$('phonetile').onclick=()=>{
-  const v=$('srcin').value.trim();
-  if(v)switchSrc(v);
-  else{$('srcnow').textContent='Type the phone URL in the box below first.';
-       $('srcin').focus();}};
+async function loadCams(){
+  try{const r=await fetch('/cameras');camList=await r.json();
+    const sel=$('camsel');sel.innerHTML='';
+    camList.forEach(c=>{const o=document.createElement('option');
+      o.value=String(c.index);o.textContent='📷 '+c.label;sel.appendChild(o);});
+    if(!camList.length){const o=document.createElement('option');
+      o.value='';o.textContent='📷 no local camera found';sel.appendChild(o);}
+  }catch(e){}}
+loadCams();
+$('camsel').onchange=()=>{if($('camsel').value!=='')switchSrc($('camsel').value);};
+$('viewsel').onchange=()=>{
+  const o=$('viewsel').selectedOptions[0];
+  $('view').src=o.value;
+  $('viewtag').textContent=o.dataset.tag;};
 $('cambtn').onclick=async()=>{
   try{const r=await fetch('/camera?on='+(camOn?0:1));const d=await r.json();
     camOn=d.camera_on;
-    $('cambtn').textContent=camOn?'🎥 Camera on':'🚫 Camera off';
+    $('cambtn').textContent=camOn?'🎥':'🚫';
     $('cambtn').classList.toggle('off',!camOn);}
   catch(e){}};
 $('autooff').onchange=()=>fetch('/camera?auto='+($('autooff').checked?1:0));
