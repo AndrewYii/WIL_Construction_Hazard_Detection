@@ -1197,6 +1197,17 @@ def main():
         daemon=True)
     det_thread.start()
 
+    if not args.headless:
+        # opencv-python-headless has no GUI: fall back to the web dashboard
+        # instead of dying silently
+        try:
+            cv2.namedWindow("_gui_probe")
+            cv2.destroyWindow("_gui_probe")
+        except cv2.error:
+            print("[live] this OpenCV build has no display support — "
+                  "switching to the web dashboard (--headless)")
+            args.headless = True
+
     server = None
     try:
         if args.headless:
