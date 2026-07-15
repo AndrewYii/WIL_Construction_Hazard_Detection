@@ -26,6 +26,10 @@ fi
 PY=venv/bin/python
 [ -x "$PY" ] || PY=python3
 
+# On the Spark, Ollama runs locally — default to localhost unless the
+# caller already pointed OLLAMA_HOST elsewhere.
+export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
+
 ARGS="${*:---weights runs/detect/plan_a_yolov8/weights/best.pt --headless --port 8090 --autostart}"
 
 tmux new-session -d -s "$SESSION" \
