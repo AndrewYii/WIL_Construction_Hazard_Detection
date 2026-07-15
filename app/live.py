@@ -583,9 +583,11 @@ def detection_loop(args, detector, in_slot: LatestFrame,
             detections, frame_diag, config.PROXIMITY_DISTANCE_RATIO)
         moving_vehicles = motion.update(detections, t0)
         workers = [d for d in detections if d.cls == 0]
-        elevated = (find_height_hazards(detections, frame.shape[0],
-                                        config.HEIGHT_ZONE_FRACTION)
-                    if args.height_zone else [])
+        # relative worker-vs-worker height check is always on; the absolute
+        # upper-zone rule additionally applies with --height-zone
+        elevated = find_height_hazards(detections, frame.shape[0],
+                                       config.HEIGHT_ZONE_FRACTION,
+                                       use_zone=args.height_zone)
 
         active = set()
         if hazard_pairs:
@@ -1187,13 +1189,29 @@ $('flipbtn').onclick=async()=>{
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').innerHTML=muted?IC.volOff:IC.vol;
   $('mutebtn').classList.toggle('off',muted);
-  if(muted&&window.speechSynthesis)speechSynthesis.cancel(); // stop mid-sentence
-  if(!muted)say('Voice alerts enabled');};
-function say(text,queue){
+  if(muted&&window.speechSynthesis){
+    speech.q=[];speech.busy=false;speechSynthesis.cancel();} // stop + flush
+  if(!muted)say('Voice alerts enabled',{pri:3,ttl:3000});};
+// Priority speech queue: an utterance always finishes its sentence; the
+// next one waits its turn; anything that sat unspoken past its ttl is
+// dropped (a stale alarm is noise, not information).
+const speech={q:[],busy:false};
+function say(text,opts){
   if(muted||!window.speechSynthesis)return;
-  const u=new SpeechSynthesisUtterance(text);
-  u.rate=1.05;u.pitch=1;u.volume=1;
-  if(!queue)speechSynthesis.cancel(); // alarms preempt; details wait their turn
+  const o=opts||{};
+  speech.q.push({text,pri:o.pri||2,exp:Date.now()+(o.ttl||8000)});
+  pumpSpeech();}
+function pumpSpeech(){
+  if(speech.busy)return;
+  const now=Date.now();
+  speech.q=speech.q.filter(i=>i.exp>now);
+  if(!speech.q.length)return;
+  speech.q.sort((a,b)=>b.pri-a.pri);
+  const item=speech.q.shift();
+  speech.busy=true;
+  const u=new SpeechSynthesisUtterance(item.text);
+  u.rate=1.08;u.pitch=1;u.volume=1;
+  u.onend=u.onerror=()=>{speech.busy=false;setTimeout(pumpSpeech,250);};
   speechSynthesis.speak(u);}
 function fmtUp(s){return s>=3600?(s/3600).toFixed(1)+'h':s>=60?(s/60).toFixed(0)+'m':s.toFixed(0)+'s';}
 async function poll(){
@@ -1221,11 +1239,11 @@ async function poll(){
         const li=document.createElement('li');
         li.innerHTML='<b>'+a.type.toUpperCase()+'</b> — '+a.message+' <i>('+a.iso+')</i>';
         log.appendChild(li);});
-      const newest=d.recent_alerts[d.recent_alerts.length-1];
-      if(newest.time>lastAlert){
-        if(lastAlert>0)say(newest.message); // don't replay history on page load
-        lastAlert=newest.time;}
-      else if(lastAlert===0)lastAlert=newest.time;
+      const fresh=d.recent_alerts.filter(a=>a.time>lastAlert);
+      if(fresh.length){
+        if(lastAlert>0) // don't replay history on page load
+          fresh.forEach(a=>say(a.message,{pri:2,ttl:7000}));
+        lastAlert=fresh[fresh.length-1].time;}
     }
     if(d.incidents&&d.incidents.length){
       const inc=$('incidents');inc.innerHTML='';
@@ -1240,7 +1258,7 @@ async function poll(){
       const key=nw.iso+nw.type+(nw.note||'');
       if(lastIncKey!==null&&key!==lastIncKey&&$('detailvoice').checked
          &&nw.note&&nw.note!=='scene review unavailable')
-        say('Detail: '+nw.note.slice(0,220),true);
+        say('Detail: '+nw.note.slice(0,220),{pri:1,ttl:20000});
       lastIncKey=key;
     }
     if(d.source!==undefined){
@@ -1390,7 +1408,8 @@ def parse_args():
                         "someone presses the camera button on the dashboard.")
     p.add_argument("--height-zone", action="store_true",
                    default=config.HEIGHT_ZONE_ENABLED,
-                   help="Enable experimental height-hazard heuristic")
+                   help="Also enable the absolute upper-zone height rule "
+                        "(the relative worker-vs-worker check is always on)")
     return p.parse_args()
 
 

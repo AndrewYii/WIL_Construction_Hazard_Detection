@@ -167,6 +167,19 @@ def test_height_zone_flags_elevated_worker():
     assert flagged == [high]
 
 
+def test_height_relative_rule_needs_two_workers():
+    # one worker high in the frame, zone rule off: nothing to compare against
+    solo = Detection(0, 0.9, (100, 50, 150, 200))
+    assert find_height_hazards([solo], 1000, use_zone=False) == []
+    # add a ground-level worker: the elevated one is flagged relative to them
+    ground = Detection(0, 0.9, (400, 600, 460, 900))
+    flagged = find_height_hazards([solo, ground], 1000, use_zone=False)
+    assert flagged == [solo]
+    # two workers at similar level: no flag (gap under 30% of frame height)
+    near = Detection(0, 0.9, (500, 550, 560, 820))
+    assert find_height_hazards([ground, near], 1000, use_zone=False) == []
+
+
 # --------------------------------------------------------------------------
 # Spark LLM client
 # --------------------------------------------------------------------------

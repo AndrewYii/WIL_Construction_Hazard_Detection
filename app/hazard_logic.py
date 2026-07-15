@@ -62,13 +62,29 @@ def find_proximity_hazards(detections: list[Detection], frame_diag: float, dista
 
 
 def find_height_hazards(detections: list[Detection], frame_height: float,
-                        zone_fraction: float = 0.45):
-    """EXPERIMENTAL: workers whose box bottom sits above zone_fraction of the
-    frame height (i.e. visually elevated). A camera-geometry heuristic, not a
-    trained signal — real height detection needs the synthetic data planned
-    for the height-hazard gap."""
-    limit = frame_height * zone_fraction
-    return [d for d in detections if d.cls == WORKER and d.xyxy[3] < limit]
+                        zone_fraction: float = 0.45, use_zone: bool = True,
+                        relative_gap: float = 0.30):
+    """EXPERIMENTAL height heuristics (a stand-in until synthetic
+    height-labeled data exists):
+
+    - Relative (always applied, needs 2+ workers): a worker whose feet are
+      more than relative_gap of the frame height above the lowest worker's
+      feet is treated as elevated. Robust to camera tilt because it compares
+      workers against each other, not against the frame.
+    - Absolute zone (use_zone): feet above zone_fraction of the frame height.
+      Only sensible with a level, ground-covering camera view.
+    """
+    workers = [d for d in detections if d.cls == WORKER]
+    flagged: list[Detection] = []
+    if len(workers) >= 2:
+        lowest_feet = max(w.xyxy[3] for w in workers)
+        gap = frame_height * relative_gap
+        flagged = [w for w in workers if lowest_feet - w.xyxy[3] > gap]
+    if use_zone:
+        limit = frame_height * zone_fraction
+        flagged += [w for w in workers
+                    if w.xyxy[3] < limit and w not in flagged]
+    return flagged
 
 
 class VehicleMotionTracker:
