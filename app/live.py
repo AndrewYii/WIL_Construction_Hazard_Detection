@@ -188,6 +188,19 @@ def parse_source(raw: str):
     return int(raw) if isinstance(raw, str) and raw.isdigit() else raw
 
 
+def public_source(src) -> str:
+    """What the HTTP API may reveal about the current source: camera index,
+    URL host, or file basename — never a filesystem path or full URL."""
+    s = str(src)
+    if isinstance(src, int) or s.isdigit():
+        return s
+    if "://" in s:
+        from urllib.parse import urlparse
+        parsed = urlparse(s)
+        return f"{parsed.scheme}://{parsed.hostname or ''}"
+    return Path(s).name
+
+
 class SourceManager:
     """Hot-swap the camera at runtime (webcam <-> RealSense <-> phone URL)
     without touching detection or connected dashboard clients."""
@@ -649,8 +662,13 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self._stream(out_slot)
             elif self.path.startswith("/events"):
                 snap = state.snapshot()
-                snap["source"] = str(sources.current)
+                snap["source"] = public_source(sources.current)
                 snap["camera_on"] = sources.camera_on
+                # never expose internal host/model inventory to viewers
+                spark = snap.get("spark") or {}
+                snap["spark"] = {"up": spark.get("up", False),
+                                 "report_model": spark.get("report_model"),
+                                 "vlm_model": spark.get("vlm_model")}
                 body = json.dumps(snap).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -758,7 +776,8 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             if raw:
                 sources.start(parse_source(raw))
                 print(f"[live] source switched to: {raw}")
-            body = json.dumps({"ok": bool(raw), "source": str(sources.current)}).encode()
+            body = json.dumps({"ok": bool(raw),
+                               "source": public_source(sources.current)}).encode()
             self.send_response(200 if raw else 400)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1193,8 +1212,8 @@ async function poll(){
     }
     const s=d.spark;
     $('spark').textContent=s.up
-      ?'Spark LLM: '+(s.report_model||'connected')+' @ '+s.host
-      :'Spark LLM: offline ('+s.host+') — reports use template fallback';
+      ?'AI reports: '+(s.report_model||'connected')
+      :'AI reports: offline — using template fallback';
   }catch(e){$('livedot').classList.remove('ok');}
 }
 async function switchSrc(v){

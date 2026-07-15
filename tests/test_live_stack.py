@@ -105,6 +105,14 @@ def test_dynamic_message_overrides_default(tmp_path):
     assert fired[0]["message"].startswith("Warning! Worker too close")
 
 
+def test_public_source_hides_internal_paths():
+    from live import public_source
+    assert public_source(0) == "0"
+    assert public_source("C:/Users/User/Desktop/secret/site_demo.mp4") == "site_demo.mp4"
+    assert public_source("/home/spark/clips/yard.mp4") == "yard.mp4"
+    assert public_source("http://192.168.0.5:8080/video?token=abc") == "http://192.168.0.5"
+
+
 def test_compose_alert_messages_describes_scene():
     from live import compose_alert_messages
     worker_a = Detection(0, 0.9, (50, 100, 90, 260))
