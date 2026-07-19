@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT / "app"))
 
 import config
 from alerts import AlertEngine
-from hazard_logic import Detection, VehicleMotionTracker, find_height_hazards
+from hazard_logic import (Detection, VehicleMotionTracker, find_height_hazards,
+                          find_ppe_violations)
 from llm_client import SparkLLM
 from report_generation import generate_hazard_report
 
@@ -125,12 +126,163 @@ def test_parse_ppe_verdicts():
     assert parse_ppe(None) is None
 
 
+def test_list_local_cameras_plain_single_webcam():
+    """A single, ordinary webcam (no duplicate-name siblings) must appear
+    exactly as reported, with no format suffix or reordering noise added —
+    the multi-node handling must be a no-op for the common case."""
+    import platform
+    from unittest.mock import mock_open, patch
+
+    import live
+
+    if platform.system() == "Windows":
+        return  # this test exercises the Linux sysfs enumeration path
+
+    live._CAM_CACHE.update(t=0.0, list=[])
+    names = {"/sys/class/video4linux/video0/name": "HP TrueVision HD\n"}
+    with patch("glob.glob", return_value=list(names)), \
+         patch("builtins.open", mock_open(read_data=""), create=True) as m_open, \
+         patch.object(live, "_v4l2_probe", return_value=(True, "YUYV 4:2:2")):
+        m_open.side_effect = lambda path, *a, **k: mock_open(
+            read_data=names[path])()
+        cams = live.list_local_cameras()
+    assert cams == [{"index": 0, "label": "HP TrueVision HD", "usable": True}]
+
+
+def test_list_local_cameras_multi_node_device_alongside_plain_webcam():
+    """A multi-node camera (RealSense-shaped: several capture nodes sharing
+    one name, some not actually capturable) coexisting with an ordinary
+    single-node webcam — proves the filtering/labeling is generic, not
+    RealSense-specific string matching. Regression test for the bug found
+    2026-07-19 (all cameras silently reported as index 4)."""
+    import platform
+    from unittest.mock import mock_open, patch
+
+    import live
+
+    if platform.system() == "Windows":
+        return
+
+    live._CAM_CACHE.update(t=0.0, list=[])
+    names = {
+        "/sys/class/video4linux/video0/name": "HP TrueVision HD\n",
+        "/sys/class/video4linux/video1/name": "Depth Module\n",
+        "/sys/class/video4linux/video2/name": "Depth Module\n",
+        "/sys/class/video4linux/video3/name": "Depth Module\n",
+        "/sys/class/video4linux/video4/name": "Depth Module\n",
+    }
+    # video1: depth (capturable, mono) · video2: metadata-only (not
+    # capturable) · video3: infrared (capturable, mono) · video4: color
+    # (capturable) — same shape as the real RealSense probe results.
+    probe_results = {
+        0: (True, "YUYV 4:2:2"),
+        1: (True, "16-bit Depth"),
+        2: (False, ""),
+        3: (True, "8-bit Greyscale"),
+        4: (True, "YUYV 4:2:2"),
+    }
+    with patch("glob.glob", return_value=sorted(names)), \
+         patch("builtins.open", create=True) as m_open, \
+         patch.object(live, "_v4l2_probe", side_effect=lambda i: probe_results[i]):
+        m_open.side_effect = lambda path, *a, **k: mock_open(
+            read_data=names[path])()
+        cams = live.list_local_cameras()
+
+    by_index = {c["index"]: c for c in cams}
+    assert by_index[0]["label"] == "HP TrueVision HD"  # untouched, no duplicates
+    assert by_index[0]["usable"] is True
+    assert 2 not in by_index  # metadata-only node dropped
+    assert "recommended" in by_index[4]["label"]
+    assert by_index[4]["usable"] is True
+    assert "not usable here, no color" in by_index[1]["label"]
+    assert by_index[1]["usable"] is False  # the dashboard must refuse to let this be clicked
+    assert "not usable here, no color" in by_index[3]["label"]
+    assert by_index[3]["usable"] is False
+    # the color node sorts before its non-color siblings
+    indices = [c["index"] for c in cams]
+    assert indices.index(4) < indices.index(1)
+    assert indices.index(4) < indices.index(3)
+
+
 def test_public_source_hides_internal_paths():
     from live import public_source
     assert public_source(0) == "0"
     assert public_source("C:/Users/User/Desktop/secret/site_demo.mp4") == "site_demo.mp4"
     assert public_source("/home/spark/clips/yard.mp4") == "yard.mp4"
     assert public_source("http://192.168.0.5:8080/video?token=abc") == "http://192.168.0.5"
+
+
+def test_annotate_marks_ppe_violator_red_despite_stale_box():
+    """ppe_violations is held over from the last throttled PPE_Detect pass
+    (up to PPE_CHECK_INTERVAL_SEC old) so its Detection is never == this
+    frame's freshly re-detected one (conf/xyxy jitter every frame) — the
+    violator box must still be matched and drawn red by spatial overlap,
+    not identity. Regression test for the bug found 2026-07-19."""
+    import numpy as np
+    from live import BOX_COLORS, PPE_VIOLATION_COLOR, annotate
+
+    frame = np.full((400, 600, 3), 220, dtype=np.uint8)
+    current_worker = Detection(0, 0.87, (100, 50, 200, 300))
+    compliant_worker = Detection(0, 0.91, (350, 60, 450, 310))
+    stale_violation = Detection(0, 0.79, (98, 48, 198, 298))  # same person, earlier pass
+
+    annotated = annotate(frame.copy(), [current_worker, compliant_worker], ["ppe"],
+                         ppe_violations=[stale_violation])
+
+    assert annotated[50, 150].tolist() == list(PPE_VIOLATION_COLOR)
+    assert annotated[60, 400].tolist() == list(BOX_COLORS[0])
+
+
+def test_verify_height_discards_result_from_a_stale_session():
+    """A VLM round trip for height verification can take several seconds.
+    If a tab switch / new upload / new camera started a fresh session while
+    it was in flight, the result belongs to a session that no longer exists
+    and must be discarded — not fired as a "new" alert on top of an
+    already-reset dashboard. Regression test for the bug found 2026-07-19
+    (a stale height alert appeared, with working voice, moments after
+    switching away from the video it was actually about)."""
+    import numpy as np
+
+    from live import IncidentAnalyst, SessionState
+
+    engine = AlertEngine(events_path=None)
+    state = SessionState(engine)
+    analyst = IncidentAnalyst(state, engine)
+    crop = np.zeros((10, 10, 3), dtype="uint8")
+
+    submitted_epoch = state.session_epoch
+    state.reset_session()  # a new session starts while the "VLM call" is still in flight
+    assert state.session_epoch != submitted_epoch
+
+    # client=None would crash if _verify_height touched it — proves the
+    # stale-epoch check short-circuits before doing any of that work
+    analyst._verify_height(client=None, message="test", crop=crop, epoch=submitted_epoch)
+
+    assert state.incidents == []
+    assert engine.counts()["height"] == 0
+
+
+def test_verify_height_fires_normally_when_epoch_still_current():
+    """Same session throughout (the common case) — verification proceeds
+    and an unconfirmed candidate still alarms, safety-first."""
+    import numpy as np
+
+    from live import IncidentAnalyst, SessionState
+
+    class _FakeClient:
+        def is_up(self):
+            return False  # VLM unreachable -> verdict stays None -> alarm fires
+
+    engine = AlertEngine(events_path=None)
+    state = SessionState(engine)
+    analyst = IncidentAnalyst(state, engine)
+    crop = np.zeros((10, 10, 3), dtype="uint8")
+
+    analyst._verify_height(client=_FakeClient(), message="Warning! test",
+                           crop=crop, epoch=state.session_epoch)
+
+    assert len(state.incidents) == 1
+    assert engine.counts()["height"] == 1
 
 
 def test_compose_alert_messages_describes_scene():
@@ -198,6 +350,50 @@ def test_height_relative_rule_needs_two_workers():
     # two workers at similar level: no flag (gap under 30% of frame height)
     near = Detection(0, 0.9, (500, 550, 560, 820))
     assert find_height_hazards([ground, near], 1000, use_zone=False) == []
+
+
+def test_ppe_violation_flags_worker_overlapping_no_hardhat():
+    worker = Detection(0, 0.9, (100, 50, 150, 200))
+    ppe_dets = [{"name": "NO-Hardhat", "conf": 0.8, "xyxy": (105, 50, 145, 90)}]
+    assert find_ppe_violations([worker], ppe_dets) == [worker]
+
+
+def test_ppe_no_violation_when_hardhat_confirmed():
+    worker = Detection(0, 0.9, (100, 50, 150, 200))
+    ppe_dets = [{"name": "Hardhat", "conf": 0.9, "xyxy": (105, 50, 145, 90)}]
+    assert find_ppe_violations([worker], ppe_dets) == []
+
+
+def test_ppe_missed_detection_is_not_a_violation():
+    # PPE model saw nothing on this worker at all — absence isn't an alarm,
+    # only an explicit NO-Hardhat/NO-Safety Vest hit is
+    worker = Detection(0, 0.9, (100, 50, 150, 200))
+    assert find_ppe_violations([worker], []) == []
+
+
+def test_ppe_violation_ignores_non_overlapping_detection():
+    worker = Detection(0, 0.9, (100, 50, 150, 200))
+    # a NO-Hardhat box far away belongs to a different, undetected worker
+    ppe_dets = [{"name": "NO-Hardhat", "conf": 0.8, "xyxy": (900, 900, 950, 950)}]
+    assert find_ppe_violations([worker], ppe_dets) == []
+
+
+def test_ppe_correlates_vest_box_below_worker_box():
+    # real geometry from test_videos/site_overview.mp4: PPE_Detect's vest
+    # box sits entirely below the worker detector's box for the same person
+    # (different models, different body-region conventions) — x-ranges
+    # nearly coincide, y-ranges don't overlap at all
+    worker = Detection(0, 0.9, (1442, 562, 1501, 704))
+    ppe_dets = [{"name": "NO-Safety Vest", "conf": 0.6, "xyxy": (1462, 792, 1503, 857)}]
+    assert find_ppe_violations([worker], ppe_dets) == [worker]
+
+
+def test_ppe_does_not_correlate_across_different_x_position():
+    # a NO-Safety Vest detection on a different worker entirely (no
+    # horizontal overlap) must not attach to this one, even if "below" it
+    worker = Detection(0, 0.9, (1344, 549, 1404, 700))
+    ppe_dets = [{"name": "NO-Safety Vest", "conf": 0.6, "xyxy": (1671, 764, 1706, 817)}]
+    assert find_ppe_violations([worker], ppe_dets) == []
 
 
 # --------------------------------------------------------------------------

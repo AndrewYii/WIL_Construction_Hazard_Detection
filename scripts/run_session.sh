@@ -8,7 +8,10 @@
 #   scripts/stop_session.sh      stop cleanly
 #
 # Usage: scripts/run_session.sh [extra live.py args...]
-# Defaults to headless mode on port 8090 with the fine-tuned weights.
+# Defaults to headless mode on port 8090 with the fine-tuned weights, in
+# standby (no --autostart) — pick a camera from the dashboard's dropdown
+# rather than guessing an index at boot. Pass --autostart yourself for
+# unattended/kiosk deployments where that's actually wanted.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,7 +33,7 @@ PY=venv/bin/python
 # caller already pointed OLLAMA_HOST elsewhere.
 export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 
-ARGS="${*:---weights runs/detect/plan_a_yolov8/weights/best.pt --headless --port 8090 --autostart}"
+ARGS="${*:---weights runs/detect/plan_a_yolov8/weights/best.pt --headless --port 8090}"
 
 tmux new-session -d -s "$SESSION" \
     "$PY app/live.py $ARGS 2>&1 | tee '$LOG'"

@@ -25,11 +25,12 @@ from pathlib import Path
 
 import config
 
-# The three hazard use cases (see docs/SPARK_SETUP.md).
+# The four hazard use cases (see docs/SPARK_SETUP.md).
 ALERT_PHRASES = {
     "proximity": "Warning! Worker too close to vehicle. Move away now.",
     "vehicle": "Caution! Heavy vehicle moving in work zone.",
     "height": "Warning! Worker working at height near edge.",
+    "ppe": "Warning! Worker without required protective equipment detected.",
 }
 
 
@@ -216,6 +217,15 @@ class AlertEngine:
     def counts(self) -> dict[str, int]:
         with self._lock:
             return {k: s.total_fired for k, s in self._states.items()}
+
+    def reset(self):
+        """New session (see SessionState.reset_session): fresh debounce
+        state and a cleared dashboard log/counts. The events.jsonl file on
+        disk is untouched — this only resets what's held in memory for the
+        live display, not the permanent audit trail."""
+        with self._lock:
+            self._states = {k: _HazardState() for k in ALERT_PHRASES}
+            self.recent = []
 
     def _log(self, event: dict):
         if not self.events_path:

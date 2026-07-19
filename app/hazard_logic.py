@@ -87,6 +87,44 @@ def find_height_hazards(detections: list[Detection], frame_height: float,
     return flagged
 
 
+PPE_VIOLATION_CLASSES = {"NO-Hardhat", "NO-Safety Vest"}
+
+
+def _correlates_with_worker(worker_box, ppe_box, x_overlap_min: float = 0.4,
+                            y_margin_ratio: float = 1.0) -> bool:
+    """PPE_Detect and the worker detector are different models trained on
+    different data — their boxes for the same person do not line up
+    pixel-for-pixel. Measured on real footage: a NO-Safety Vest box can sit
+    ~0.6x a worker-box-height entirely below the worker box (the worker
+    detector's box ends around the torso; the vest region reads lower), so
+    literal rectangle intersection misses genuine matches. This instead
+    requires solid horizontal overlap (same person, side to side) plus a
+    generous vertical margin below the worker box to account for that gap.
+    """
+    wx1, wy1, wx2, wy2 = worker_box
+    px1, py1, px2, py2 = ppe_box
+    x_overlap = max(0, min(wx2, px2) - max(wx1, px1))
+    x_span_min = min(wx2 - wx1, px2 - px1)
+    if x_span_min <= 0 or x_overlap / x_span_min < x_overlap_min:
+        return False
+    h = wy2 - wy1
+    return py1 <= wy2 + h * y_margin_ratio and py2 >= wy1 - h * 0.2
+
+
+def find_ppe_violations(workers: list[Detection], ppe_detections: list[dict]) -> list[Detection]:
+    """Baseline PPE compliance: worker Detections correlated with an
+    explicit PPE_Detect negative-class box (NO-Hardhat / NO-Safety Vest).
+
+    Absence of any PPE detection on a worker is deliberately NOT treated as
+    a violation — only a positive negative-class hit counts. A worker the
+    PPE model simply didn't see (angle, distance, occlusion) would otherwise
+    flag constantly and make the baseline check noise instead of signal.
+    """
+    negatives = [d["xyxy"] for d in ppe_detections if d["name"] in PPE_VIOLATION_CLASSES]
+    return [w for w in workers
+           if any(_correlates_with_worker(w.xyxy, n) for n in negatives)]
+
+
 class VehicleMotionTracker:
     """Tracks vehicle centroids across detection passes and flags vehicles
     moving faster than move_ratio_per_sec (fraction of frame diagonal per

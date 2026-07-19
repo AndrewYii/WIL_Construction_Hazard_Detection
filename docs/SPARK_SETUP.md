@@ -70,10 +70,13 @@ sudo apt install espeak-ng    # voice clips for server-side audio
 Then:
 - live monitor + dashboard: `scripts/run_session.sh` → phone opens
   `http://<spark-ip>:8090` (tap the voice button once — mobile browsers
-  need one tap before they allow speech)
-- upload app (optional): `streamlit run app/app.py --server.address 0.0.0.0`
-  → `http://<spark-ip>:8501`
-- `OLLAMA_HOST` can stay default on the Spark itself (localhost:11434)
+  need one tap before they allow speech). This is the only GUI — it also
+  covers video upload/review and report export (PDF/TXT/JSON), so there is
+  no separate upload app anymore.
+- `OLLAMA_HOST` defaults to `localhost:11434` on the Spark itself. Copy
+  `.env.example` to `.env` at the project root and set `OLLAMA_HOST` there
+  if Ollama listens on a different port — `.env` is gitignored and loaded
+  automatically by `app/config.py`.
 
 ## 3. Real-time monitor
 
@@ -114,8 +117,16 @@ Walk the site with the phone; watch the dashboard (and hear alerts) from any
 browser. Phone and Spark must be on the same network (or both on Tailscale).
 
 **Intel RealSense.** Must be plugged into the detection machine by USB3 —
-depth does not survive ordinary network streaming. Its RGB stream registers
-as a normal webcam, so `--source 0` (or 1) works with no code changes.
+depth does not survive ordinary network streaming (running it through a
+USB2 hub causes the device to silently drop off under load). It exposes
+several `/dev/videoN` nodes (depth, infrared, color, plus metadata-only
+ones) that all report the identical device name, not just one at a
+predictable index — the dashboard's camera dropdown now filters out the
+non-capturable nodes and labels the rest by pixel format (e.g. "YUYV 4:2:2"
+is typically the real color stream, "16-bit Depth" and "8-bit Greyscale"
+are not), so pick from there rather than assuming `--source 0`. No code
+changes needed either way — RGB just registers as a normal webcam once
+you've picked the right index.
 Planned upgrade once mounted: read aligned depth via `pyrealsense2` and
 convert the proximity hazard from pixel distance to true metres — a large
 accuracy gain for the proximity use case.

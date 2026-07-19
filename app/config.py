@@ -13,12 +13,20 @@ code runs on the DGX Spark (headless server) and a dev laptop without edits.
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# .env lives at the project root (gitignored) and never overrides variables
+# already set in the shell, so `run_session.sh`'s own export still wins.
+load_dotenv(PROJECT_ROOT / ".env")
 
 # --- Ollama server (NVIDIA DGX Spark) ------------------------------------
 # Set OLLAMA_HOST (or SPARK_OLLAMA_HOST) to the Spark's address, e.g.
 #   OLLAMA_HOST=http://192.168.1.50:11434
-# The placeholder below assumes the hostname "spark" resolves on your LAN.
+# The port matters too — Ollama's default is 11434, but set it in .env if
+# your Spark's instance listens elsewhere. The placeholder below assumes
+# the hostname "spark" resolves on your LAN.
 OLLAMA_HOST = (
     os.environ.get("SPARK_OLLAMA_HOST")
     or os.environ.get("OLLAMA_HOST")
@@ -58,16 +66,44 @@ VEHICLE_MOVE_RATIO_PER_SEC = float(os.environ.get("VEHICLE_MOVE_RATIO_PER_SEC", 
 HEIGHT_ZONE_ENABLED = os.environ.get("HEIGHT_ZONE_ENABLED", "0") == "1"
 HEIGHT_ZONE_FRACTION = float(os.environ.get("HEIGHT_ZONE_FRACTION", "0.45"))
 
+# --- PPE compliance (PPE_Detect/best.pt: Hardhat/Safety Vest/boots/gloves) -
+# Baseline check on every detected worker, plus the cross-check that lets a
+# height alarm suppress itself (see hazard_logic.find_ppe_violations and
+# live.py IncidentAnalyst._verify_height). Has no harness class — that's
+# still the VLM's job.
+PPE_MODEL_PATH = PROJECT_ROOT / "PPE_Detect" / "best.pt"
+PPE_ENABLED = os.environ.get("PPE_ENABLED", "1") == "1"
+PPE_CONF = float(os.environ.get("PPE_CONF", "0.5"))
+# Full-frame PPE_Detect pass runs on this interval, not every frame — it's a
+# second YOLO model, so this caps the added inference cost.
+PPE_CHECK_INTERVAL_SEC = float(os.environ.get("PPE_CHECK_INTERVAL_SEC", "2.0"))
+
 # --- Alerts ----------------------------------------------------------------
 # Consecutive detection passes a hazard must persist before the alarm fires
 # (debounce against single-frame flickers), and the cooldown between repeats
 # of the same alert so the voice does not spam the site.
 ALERT_TRIGGER_FRAMES = int(os.environ.get("ALERT_TRIGGER_FRAMES", "3"))
-ALERT_COOLDOWN_SEC = float(os.environ.get("ALERT_COOLDOWN_SEC", "6"))
+# The FIRST alert of a hazard type is always instant regardless of this
+# value — cooldown only spaces out REPEATS of an ongoing hazard. Bumped
+# 6->8s (2026-07-19) to feel less spammy on busy scenes without dulling the
+# on-the-spot reaction to a new hazard.
+ALERT_COOLDOWN_SEC = float(os.environ.get("ALERT_COOLDOWN_SEC", "8"))
 # On-the-spot AI analysis: min seconds between automatic live-report rewrites
 REPORT_REFRESH_SEC = float(os.environ.get("REPORT_REFRESH_SEC", "45"))
 AUDIO_DIR = PROJECT_ROOT / "assets" / "audio"
 EVENTS_LOG = PROJECT_ROOT / "logs" / "events.jsonl"
+
+# --- Server-side voice (Piper neural TTS) -----------------------------------
+# Browser Web Speech API quality is whatever's installed on each viewer's own
+# device — on a bare Linux box that's espeak-ng (robotic), with nothing
+# better to pick from no matter how the browser-side voice is chosen. Piper
+# synthesizes server-side instead (~200ms for a short alert, one-time model
+# load at startup) so every viewer gets the same natural voice regardless of
+# their own device. Falls back to the browser's own voice automatically if
+# disabled or the model file is missing — never blocks the dashboard.
+TTS_ENABLED = os.environ.get("TTS_ENABLED", "1") == "1"
+TTS_VOICE_PATH = PROJECT_ROOT / "assets" / "tts_voices" / os.environ.get(
+    "TTS_VOICE", "en_US-ryan-medium.onnx")
 
 # --- Live dashboard ----------------------------------------------------------
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8090"))

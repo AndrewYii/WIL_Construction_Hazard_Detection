@@ -16,6 +16,7 @@ COPY runs/detect/plan_a_yolov8/weights/best.pt ./runs/detect/plan_a_yolov8/weigh
 
 # Phase 2 report generation calls a local Ollama server (not bundled here).
 # If unreachable, report_generation.py falls back to a template report automatically.
-EXPOSE 8501
+EXPOSE 8090
 
-CMD ["streamlit", "run", "app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["python3", "app/live.py", "--headless", "--port", "8090", "--autostart", \
+     "--weights", "runs/detect/plan_a_yolov8/weights/best.pt"]

@@ -3,7 +3,7 @@ Real-time construction hazard detection with on-the-spot audio alerts.
 
 Pipeline (all threads, never blocking each other):
   capture thread  -> latest-frame slot (stale frames dropped)
-  detection loop  -> YOLO -> hazard layer (proximity / vehicle / height)
+  detection loop  -> YOLO -> hazard layer (proximity / vehicle / height / ppe)
                   -> alert engine (voice + siren + events.jsonl)
                   -> publishes annotated frame
   HTTP threads    -> JPEG-encode the latest annotated frame per client
@@ -36,22 +36,72 @@ import cv2
 
 import config
 from alerts import AlertEngine, AudioPlayer
-from hazard_logic import (Detection, VehicleMotionTracker, find_height_hazards,
+from hazard_logic import (Detection, VehicleMotionTracker, boxes_overlap,
+                          find_height_hazards, find_ppe_violations,
                           find_proximity_hazards)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 BOX_COLORS = {0: (80, 220, 60), 1: (0, 165, 255)}  # BGR: workers green, vehicles orange
 CLASS_NAMES = {0: "worker", 1: "vehicle"}
 ALERT_BG = (30, 30, 220)
+PPE_VIOLATION_COLOR = (0, 0, 255)  # BGR pure red — overrides the normal worker green
 
 HAZARD_LABELS = {
     "proximity": "WORKER TOO CLOSE TO VEHICLE",
     "vehicle": "VEHICLE MOVING IN WORK ZONE",
     "height": "WORKER AT HEIGHT",
+    "ppe": "PPE NOT WORN",
 }
 
 
 _CAM_CACHE = {"t": 0.0, "list": []}
+
+# V4L2 ioctl constants (Linux, architecture-independent — videodev2.h).
+# QUERYCAP/ENUM_FMT are metadata-only queries: they never start streaming,
+# so unlike opening the device for capture they don't light up the camera's
+# LED or interfere with an active capture elsewhere.
+_VIDIOC_QUERYCAP = 0x80685600
+_VIDIOC_ENUM_FMT = 0xC0405602
+_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+_V4L2_CAP_DEVICE_CAPS = 0x80000000
+_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+
+
+def _v4l2_probe(index: int) -> tuple[bool, str]:
+    """(can_capture, format_description) for /dev/videoN, via metadata-only
+    ioctls. A single physical camera (RealSense, some depth/IR modules, some
+    webcams with a separate metadata interface) can expose SEVERAL /dev/videoN
+    nodes sharing the exact same name — most of them not actually usable for
+    capture, which otherwise makes the dashboard's camera list show several
+    identical, mostly-broken entries. can_capture=False for those; the format
+    description (e.g. "YUYV 4:2:2", "16-bit Depth") disambiguates the rest."""
+    import fcntl
+    import os
+    import struct
+    try:
+        fd = os.open(f"/dev/video{index}", os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return False, ""
+    try:
+        cap = bytearray(104)
+        fcntl.ioctl(fd, _VIDIOC_QUERYCAP, cap)
+        caps, device_caps = struct.unpack_from("<II", cap, 84)
+        effective = device_caps if (caps & _V4L2_CAP_DEVICE_CAPS) else caps
+        if not (effective & _V4L2_CAP_VIDEO_CAPTURE):
+            return False, ""
+        desc = ""
+        fmt = bytearray(64)
+        struct.pack_into("<II", fmt, 0, 0, _V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        try:
+            fcntl.ioctl(fd, _VIDIOC_ENUM_FMT, fmt)
+            desc = fmt[12:44].split(b"\0", 1)[0].decode(errors="replace")
+        except OSError:
+            pass
+        return True, desc
+    except OSError:
+        return False, ""
+    finally:
+        os.close(fd)
 
 
 def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
@@ -60,7 +110,9 @@ def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
 
     Windows: DirectShow's own device list (pygrabber) — the order exactly
     matches cv2.CAP_DSHOW indices, so labels can't be swapped.
-    Linux: /sys/class/video4linux/videoN/name — N is the OpenCV index.
+    Linux: /sys/class/video4linux/videoN/name — N is the OpenCV index, then
+    filtered/disambiguated via _v4l2_probe for cameras exposing multiple
+    identically-named nodes.
     Fallback: probe indices by opening them (old behavior). Cached 15s."""
     import platform
     now = time.time()
@@ -77,28 +129,56 @@ def list_local_cameras(current=None, max_probe: int = 5) -> list[dict]:
                 names = FilterGraph().get_input_devices()
             finally:
                 comtypes.CoUninitialize()
-            cams = [{"index": i, "label": n} for i, n in enumerate(names)]
+            cams = [{"index": i, "label": n, "usable": True} for i, n in enumerate(names)]
         else:
             import glob
             import re as _re
+            raw = []
             for path in sorted(glob.glob("/sys/class/video4linux/video*/name")):
-                m = _re.search(r"video(\d+)", path)
+                # anchor to the trailing "videoN/name" — a naive "video(\d+)"
+                # search matches "video4" out of "video4linux" first and
+                # reports every camera as index 4 (a real bug found 2026-07-19)
+                m = _re.search(r"video(\d+)/name$", path)
                 if not m:
                     continue
                 with open(path) as f:
-                    cams.append({"index": int(m.group(1)),
-                                 "label": f.read().strip()})
+                    raw.append({"index": int(m.group(1)), "label": f.read().strip()})
+            dupes = {c["label"] for c in raw
+                     if sum(1 for o in raw if o["label"] == c["label"]) > 1}
+            for c in raw:
+                can_capture, desc = _v4l2_probe(c["index"])
+                if not can_capture:
+                    continue  # metadata-only node — not something cv2 can stream
+                c["usable"] = True
+                if c["label"] in dupes:
+                    # Some multi-sensor cameras (RealSense: depth+IR+color)
+                    # expose several capture-capable nodes under one name —
+                    # flag the ones that are unambiguously not color. Labeling
+                    # alone wasn't foolproof enough (2026-07-19: a user still
+                    # picked the depth node after it was clearly marked "not
+                    # usable" — three identical-looking entries invite a
+                    # misclick regardless of label text, and RealSense's own
+                    # USB flakiness can renumber which index is which between
+                    # reconnects). `usable` lets the dashboard make the wrong
+                    # ones genuinely unclickable instead of just labeled.
+                    mono = any(k in desc.lower() for k in
+                              ("depth", "grey", "gray", "infrared"))
+                    suffix = " — not usable here, no color" if mono else " (recommended)"
+                    c["label"] = f"{c['label']} — {desc or 'unknown format'}{suffix} (video{c['index']})"
+                    c["usable"] = not mono
+                cams.append(c)
+            cams.sort(key=lambda c: not c["usable"])
     except Exception:
         cams = []
     if not cams:  # fallback: probe by opening (may blink camera LEDs)
         backend = cv2.CAP_DSHOW if system == "Windows" else cv2.CAP_ANY
         for i in range(max_probe):
             if current is not None and i == current:
-                cams.append({"index": i, "label": f"Camera {i}"})
+                cams.append({"index": i, "label": f"Camera {i}", "usable": True})
                 continue
             cap = cv2.VideoCapture(i, backend)
             if cap.isOpened():
-                cams.append({"index": i, "label": f"Camera {i}"})
+                cams.append({"index": i, "label": f"Camera {i}", "usable": True})
             cap.release()
     _CAM_CACHE.update(t=now, list=cams)
     return cams
@@ -114,6 +194,33 @@ def camera_off_frame(text: str = "CAMERA OFF", shape=(360, 640, 3)):
     cv2.putText(frame, text, (max((w - tw) // 2, 10), (h + th) // 2), FONT, 0.9,
                 (120, 120, 120), 2)
     return frame
+
+
+def load_tts_voice():
+    """Server-side neural voice (Piper) for alerts — every viewer hears the
+    same natural voice regardless of what's installed on their own device.
+    Loaded once at startup (~0.7s); synthesis itself is ~150-200ms for a
+    short alert sentence, well inside "on the spot". Returns None (and the
+    dashboard silently falls back to each browser's own Web Speech API) if
+    disabled or the voice model hasn't been downloaded — never blocks
+    startup or crashes the dashboard over a missing/optional voice."""
+    if not config.TTS_ENABLED:
+        return None
+    if not config.TTS_VOICE_PATH.exists():
+        print(f"[live] TTS voice not found at {config.TTS_VOICE_PATH} — "
+              "falling back to each browser's own voice. Get one with: "
+              "python -m piper.download_voices --download-dir "
+              "assets/tts_voices en_US-ryan-medium")
+        return None
+    try:
+        from piper import PiperVoice
+        voice = PiperVoice.load(str(config.TTS_VOICE_PATH))
+        print(f"[live] TTS voice loaded: {config.TTS_VOICE_PATH.name}")
+        return voice
+    except Exception as exc:
+        print(f"[live] TTS voice failed to load ({exc}) — falling back to "
+              "each browser's own voice")
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +400,17 @@ class SourceManager:
             if self.capture:
                 self.capture.stop_flag.set()
 
+    @property
+    def is_file_source(self) -> bool:
+        """True while the current source is a looping uploaded video, not a
+        live camera/RTSP/browser feed. The meeting-style privacy auto-off
+        exists to dim a webcam's LED when nobody's watching — it must not
+        also kill an uploaded video's playback just because the tab was
+        briefly closed (e.g. mid page-refresh), which used to freeze the
+        stream on a permanent "camera off" placeholder with no way back
+        short of manually toggling the camera button."""
+        return self._loop_file
+
 
 # --------------------------------------------------------------------------
 # Detectors
@@ -358,6 +476,30 @@ class SessionState:
         self.auto_off = True              # camera auto-off when last viewer leaves
         self.mirror = False               # horizontal flip (front-facing cameras)
         self.height_flash_until = 0.0     # banner window after verified height alert
+        self.session_epoch = 0            # bumped by reset_session() — see IncidentAnalyst
+
+    def reset_session(self):
+        """A new source (upload, camera switch, or a tab change that stops
+        the previous one) starts a fresh session — old counts/log/report
+        mixed with a totally different video or camera is misleading, not
+        historical record-keeping (2026-07-19). Only resets what the
+        dashboard displays live; logs/events.jsonl (the permanent audit
+        trail) is untouched — this is a display reset, not data deletion."""
+        with self.lock:
+            self.start_time = time.time()
+            self.frames = 0
+            self.fps = 0.0
+            self.workers_now = 0
+            self.vehicles_now = 0
+            self.peak = {"worker": 0, "dangerous_vehicle": 0}
+            self.totals = {"worker": 0, "dangerous_vehicle": 0}
+            self.active_hazards = []
+            self.proximity_events = []
+            self.incidents = []
+            self.live_report = ""
+            self.height_flash_until = 0.0
+            self.session_epoch += 1  # any in-flight analyst job from before this must be discarded
+        self.engine.reset()
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -447,17 +589,19 @@ class IncidentAnalyst(threading.Thread):
     )
 
     def __init__(self, state: SessionState, engine: AlertEngine | None = None,
-                 report_refresh_sec: float = config.REPORT_REFRESH_SEC):
+                 report_refresh_sec: float = config.REPORT_REFRESH_SEC,
+                 ppe_detector=None):
         super().__init__(daemon=True)
         self.state = state
         self.engine = engine
         self.report_refresh_sec = report_refresh_sec
+        self.ppe_detector = ppe_detector
         self._jobs: queue.Queue = queue.Queue(maxsize=4)
         self._last_report = 0.0
 
     def submit(self, event: dict, frame):
         try:
-            self._jobs.put_nowait(("incident", event, frame))
+            self._jobs.put_nowait(("incident", event, frame, self.state.session_epoch))
         except queue.Full:
             pass  # analysis is best-effort; the alert itself already fired
 
@@ -465,11 +609,33 @@ class IncidentAnalyst(threading.Thread):
         """Verify a geometric height candidate: alert only if the worker has
         no visible fall protection (or if verification is impossible)."""
         try:
-            self._jobs.put_nowait(("height", message, crop))
+            self._jobs.put_nowait(("height", message, crop, self.state.session_epoch))
         except queue.Full:
             pass
 
-    def _verify_height(self, client, message: str, crop):
+    def _check_ppe_detector(self, crop) -> dict | None:
+        """Run the local PPE_Detect model on the height crop. Returns
+        {'hardhat': bool} or None if the detector is unavailable/disabled —
+        None counts as "not confirmed", same as an unparseable VLM verdict."""
+        if self.ppe_detector is None:
+            return None
+        try:
+            dets = self.ppe_detector.predict(crop, conf=config.PPE_CONF, imgsz=320)
+        except Exception:
+            return None
+        has_hardhat = any(d["name"] == "Hardhat" for d in dets)
+        has_no_hardhat = any(d["name"] == "NO-Hardhat" for d in dets)
+        return {"hardhat": has_hardhat and not has_no_hardhat}
+
+    def _verify_height(self, client, message: str, crop, epoch: int):
+        # This VLM round trip can take several seconds — if a tab switch or
+        # new upload started a new session while it was running (found
+        # 2026-07-19: a stale height verdict fired an alert well after the
+        # user had already switched away from the video it was about), the
+        # result belongs to a session that no longer exists. Bail out before
+        # doing the (wasted) work if it's already stale.
+        if epoch != self.state.session_epoch:
+            return
         verdict = None
         try:
             ok, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -478,18 +644,33 @@ class IncidentAnalyst(threading.Thread):
                                                           jpg.tobytes()))
         except Exception:
             verdict = None
-        protected = bool(verdict and (verdict["harness"] or verdict["hardhat"]))
+        if epoch != self.state.session_epoch:
+            return  # session moved on while the VLM call was in flight
+        ppe_check = self._check_ppe_detector(crop)
+        # Two independent signals required to suppress a real fall-risk
+        # alarm: the VLM must see the harness itself (the item that actually
+        # matters — no local detector here has that class), AND PPE_Detect
+        # must independently confirm a hardhat on the same crop. Either one
+        # missing/unconfirmed/disagreeing → alarm fires (safety-first). If
+        # PPE_Detect is unavailable (weights missing / PPE_ENABLED=0), the
+        # cross-check can never pass, so height alarms always fire.
+        protected = bool(verdict and verdict["harness"]
+                         and ppe_check and ppe_check["hardhat"])
         if protected:
-            note = ("Height check: worker elevated but fall-protection PPE "
-                    f"visible (hardhat={verdict['hardhat']}, "
-                    f"harness={verdict['harness']}) — alarm suppressed.")
+            note = ("Height check: worker elevated, harness visible (VLM) and "
+                    "hardhat confirmed (PPE_Detect) — alarm suppressed.")
         else:
             if verdict is None:
                 message += " PPE could not be verified."
+            elif not verdict["harness"]:
+                message += " No harness visible."
+            elif not (ppe_check and ppe_check["hardhat"]):
+                message += " Hardhat not confirmed."
             fired = self.engine.fire_now("height", message) if self.engine else None
-            note = ("Height ALERT: no fall-protection PPE visible on elevated "
-                    "worker." if fired else
-                    "Height: elevated without PPE, alarm cooling down.")
+            note = ("Height ALERT: fall protection not fully confirmed on "
+                    f"elevated worker (harness={bool(verdict and verdict['harness'])}, "
+                    f"hardhat={bool(ppe_check and ppe_check['hardhat'])})." if fired else
+                    "Height: elevated without confirmed PPE, alarm cooling down.")
             if fired:
                 with self.state.lock:
                     self.state.height_flash_until = time.time() + 6
@@ -504,10 +685,12 @@ class IncidentAnalyst(threading.Thread):
         from report_generation import generate_hazard_report
         client = get_client()
         while True:
-            kind, event, frame = self._jobs.get()
+            kind, event, frame, epoch = self._jobs.get()
             if kind == "height":
-                self._verify_height(client, event, frame)
+                self._verify_height(client, event, frame, epoch)
                 continue
+            if epoch != self.state.session_epoch:
+                continue  # stale — a new session started while this was queued
             note = None
             try:
                 ok, jpg = cv2.imencode(".jpg", frame,
@@ -519,6 +702,8 @@ class IncidentAnalyst(threading.Thread):
                     note = client.describe_image(prompt, jpg.tobytes())
             except Exception:
                 note = None
+            if epoch != self.state.session_epoch:
+                continue  # session moved on while the VLM call was in flight
             with self.state.lock:
                 self.state.incidents.append({
                     "iso": event.get("iso", ""),
@@ -573,12 +758,24 @@ def _draw_subtitle(frame, text):
     cv2.putText(frame, text, (x, y), FONT, scale, (255, 255, 255), 2)
 
 
-def annotate(frame, detections, hazard_types, hazard_pairs=None):
+def annotate(frame, detections, hazard_types, hazard_pairs=None, ppe_violations=None):
+    ppe_violations = ppe_violations or []
     for det in detections:
         x1, y1, x2, y2 = [int(v) for v in det.xyxy]
-        color = BOX_COLORS.get(det.cls, (200, 200, 200))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        # A PPE-violating worker gets its own red box + label, on top of
+        # (not instead of) the normal box color — a red worker box says
+        # exactly who's non-compliant at a glance, not just that PPE is
+        # some hazard somewhere in frame. ppe_violations is held over from
+        # the last throttled PPE_Detect pass (up to PPE_CHECK_INTERVAL_SEC
+        # old) — its Detection objects are stale, never equal to this
+        # frame's freshly re-detected ones (conf/xyxy jitter every frame),
+        # so match by spatial overlap, not identity/equality.
+        violator = any(boxes_overlap(det.xyxy, v.xyxy) for v in ppe_violations)
+        color = PPE_VIOLATION_COLOR if violator else BOX_COLORS.get(det.cls, (200, 200, 200))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if violator else 2)
         label = f"{CLASS_NAMES.get(det.cls, det.cls)} {det.conf:.2f}"
+        if violator:
+            label += " — NO PPE"
         cv2.putText(frame, label, (x1, max(y1 - 6, 14)), FONT, 0.5, color, 2)
     y = 34
     for kind in hazard_types:
@@ -612,7 +809,7 @@ def _at_side(det, frame_w: float) -> str:
 
 
 def compose_alert_messages(hazard_pairs, moving_vehicles, elevated, workers,
-                           frame_w: float) -> dict[str, str]:
+                           frame_w: float, ppe_violations=None) -> dict[str, str]:
     """Scene-specific spoken phrases built from detection geometry — composed
     in microseconds at the moment of detection, no model involved, so the
     descriptive voice alert still fires on the spot."""
@@ -632,6 +829,11 @@ def compose_alert_messages(hazard_pairs, moving_vehicles, elevated, workers,
     if elevated:
         msgs["height"] = (f"Warning! Worker at height {at(elevated[0])}. "
                           "Check fall protection.")
+    if ppe_violations:
+        n = len(ppe_violations)
+        who = "One worker" if n == 1 else f"{n} workers"
+        msgs["ppe"] = (f"Warning! {who} without required protective equipment "
+                       f"{at(ppe_violations[0])}.")
     return msgs
 
 
@@ -642,7 +844,7 @@ def compose_alert_messages(hazard_pairs, moving_vehicles, elevated, workers,
 def detection_loop(args, detector, in_slot: LatestFrame,
                    out_slot: LatestFrame, state: SessionState, engine: AlertEngine,
                    stop_flag: threading.Event, analyst: IncidentAnalyst | None = None,
-                   raw_slot: LatestFrame | None = None):
+                   raw_slot: LatestFrame | None = None, ppe_detector=None):
     motion = None
     frame_diag = None
     frame_shape = None
@@ -650,6 +852,9 @@ def detection_loop(args, detector, in_slot: LatestFrame,
     fps_smooth = None
     height_since = None       # when the current elevated streak began
     last_height_check = 0.0   # last VLM PPE verification
+    last_ppe_check = 0.0      # last full-frame PPE_Detect pass
+    ppe_violations: list[Detection] = []  # held over between throttled checks
+    had_workers = False       # for an instant PPE check when a worker first appears
 
     while not stop_flag.is_set():
         frame, last_seq = in_slot.get(last_seq)
@@ -708,12 +913,31 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         else:
             height_since = None
 
+        # Baseline PPE compliance: a second, lightweight YOLO pass over the
+        # full frame on its own interval (not every frame — it's a whole
+        # extra model). The verdict is held over between checks so it stays
+        # stable across the debounce window instead of flickering. A worker
+        # newly entering an empty frame forces an immediate check instead of
+        # waiting out the interval — someone walking into view should get
+        # checked right away, not up to PPE_CHECK_INTERVAL_SEC late (user
+        # feedback 2026-07-19: "PPE should check first").
+        worker_just_appeared = bool(workers) and not had_workers
+        had_workers = bool(workers)
+        if ppe_detector is not None and (worker_just_appeared
+                or t0 - last_ppe_check >= config.PPE_CHECK_INTERVAL_SEC):
+            last_ppe_check = t0
+            ppe_dets = ppe_detector.predict(frame, conf=config.PPE_CONF, imgsz=args.imgsz)
+            ppe_violations = find_ppe_violations(workers, ppe_dets)
+        if ppe_violations and workers:
+            active.add("ppe")
+
         fired = engine.update(
             active,
             detail={"frame": state.frames, "workers": len(workers),
                     "pairs": len(hazard_pairs)},
             messages=compose_alert_messages(hazard_pairs, moving_vehicles,
-                                            elevated, workers, frame.shape[1]))
+                                            elevated, workers, frame.shape[1],
+                                            ppe_violations=ppe_violations))
 
         # --- bookkeeping ----------------------------------------------------
         n_workers = len(workers)
@@ -741,7 +965,8 @@ def detection_loop(args, detector, in_slot: LatestFrame,
                 })
                 del state.proximity_events[:-5000]
 
-        annotated = annotate(frame, detections, sorted(display), hazard_pairs)
+        annotated = annotate(frame, detections, sorted(display), hazard_pairs,
+                            ppe_violations=ppe_violations)
         annotated = draw_hud(annotated, state)
         out_slot.put(annotated)
 
@@ -784,7 +1009,7 @@ PWA_SW = "self.addEventListener('fetch',()=>{});"
 
 def make_handler(out_slot: LatestFrame, state: SessionState,
                  sources: "SourceManager", raw_slot: LatestFrame | None = None,
-                 in_slot: LatestFrame | None = None):
+                 in_slot: LatestFrame | None = None, tts_voice=None):
     dashboard = DASHBOARD_HTML
 
     class Handler(BaseHTTPRequestHandler):
@@ -842,6 +1067,12 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self._camera()
             elif self.path.startswith("/report"):
                 self._report()
+            elif self.path.startswith("/tts"):
+                self._tts()
+            elif self.path.startswith("/reset"):
+                self._reset()
+            elif self.path.startswith("/arm"):
+                self._arm()
             else:
                 self.send_error(404)
 
@@ -872,6 +1103,7 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                     f.write(chunk)
                     remaining -= len(chunk)
             sources.start(str(path), loop_file=True)  # loops for the demo
+            state.reset_session()  # a new video is a new session, not a continuation
             print(f"[live] uploaded video now playing: {safe}")
             body = json.dumps({"ok": True, "source": safe}).encode()
             self.send_response(200)
@@ -916,6 +1148,16 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.end_headers()
             self.wfile.write(body)
 
+        def _reset(self):
+            """Explicit session reset — called by the dashboard when a tab
+            switch stops the previous mode's source. Deliberately a separate
+            action from /camera?on=0: the meeting-style auto-off (everyone
+            closed their tab, or a manual camera-off toggle) must NOT wipe
+            a session's accumulated stats just because the same source will
+            resume in a few seconds — only an actual mode change should."""
+            state.reset_session()
+            self._static('{"ok": true}', "application/json")
+
         def _camera(self):
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
@@ -959,7 +1201,35 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             raw = (parse_qs(urlparse(self.path).query).get("src") or [""])[0].strip()
             if raw:
                 sources.start(parse_source(raw))
+                state.reset_session()  # a different source is a new session
                 print(f"[live] source switched to: {raw}")
+            body = json.dumps({"ok": bool(raw),
+                               "source": public_source(sources.current)}).encode()
+            self.send_response(200 if raw else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _arm(self):
+            """Point SourceManager.current at a device WITHOUT opening it —
+            consent model: the camera only actually opens once the user
+            presses the camera button. Exists to fix a real bug (2026-07-19):
+            entering the Camera tab used to only call /camera?on=0, which
+            stops whatever was running but leaves `current` exactly where it
+            was — still an uploaded video's file path, or the raw startup
+            default index (often the wrong node on a multi-stream camera).
+            Pressing the camera-on button afterward would then resume that
+            stale/wrong source instead of the dropdown's recommended camera.
+            One decisive call instead of two also removes a race: the old
+            two-call "stop, then let the user separately pick" sequence
+            could have its own stop response land AFTER a fast follow-up
+            camera selection and turn it back off."""
+            from urllib.parse import parse_qs, urlparse
+            raw = (parse_qs(urlparse(self.path).query).get("src") or [""])[0].strip()
+            if raw:
+                sources.arm(parse_source(raw))
+                state.reset_session()
             body = json.dumps({"ok": bool(raw),
                                "source": public_source(sources.current)}).encode()
             self.send_response(200 if raw else 400)
@@ -1014,15 +1284,73 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             self.wfile.write(b"\r\n")
 
         def _report(self):
+            from urllib.parse import parse_qs, urlparse
+            fmt = (parse_qs(urlparse(self.path).query).get("format") or [""])[0]
+            if fmt == "json":
+                body = json.dumps(state.to_report_dict(), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="hazard_report.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 from report_generation import generate_hazard_report
                 text = generate_hazard_report(state.to_report_dict())
                 status = 200
             except Exception as exc:
                 text, status = f"Report generation failed: {exc}", 500
+            if fmt == "pdf" and status == 200:
+                from report_generation import report_to_pdf
+                body = report_to_pdf(text)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="site_safety_report.pdf"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = text.encode()
             self.send_response(status)
-            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            if fmt == "txt" and status == 200:
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="site_safety_report.txt"')
+            else:
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _tts(self):
+            """Server-synthesized alert audio (Piper) — see load_tts_voice().
+            404 tells the dashboard JS to fall back to the browser's own
+            Web Speech API for this utterance; never blocks or 500s over a
+            speech engine hiccup, voice alerts must never crash the page."""
+            if tts_voice is None:
+                self.send_error(404, "server TTS not available")
+                return
+            from urllib.parse import parse_qs, urlparse
+            text = (parse_qs(urlparse(self.path).query).get("text") or [""])[0][:500]
+            if not text:
+                self.send_error(400, "missing text")
+                return
+            try:
+                import io
+                import wave
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wav_file:
+                    tts_voice.synthesize_wav(text, wav_file)
+                body = buf.getvalue()
+            except Exception as exc:
+                self.send_error(500, f"synthesis failed: {exc}")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1040,7 +1368,7 @@ def camera_watchdog(state: SessionState, sources: SourceManager,
         time.sleep(5)
         with state.lock:
             viewers, auto = state.viewers, state.auto_off
-        if viewers == 0 and auto and sources.camera_on:
+        if viewers == 0 and auto and sources.camera_on and not sources.is_file_source:
             zero_since = zero_since or time.time()
             if time.time() - zero_since >= grace_sec:
                 sources.set_camera(False)
@@ -1143,6 +1471,13 @@ button:hover{background:var(--tint);border-color:var(--cyandark)}
 button.mute.off{border-color:var(--mut);color:var(--mut)}
 #reportbtn{background:var(--cyan);color:#fff;border-color:var(--cyandark)}
 #reportbtn:hover{background:var(--cyandark)}
+a.dlbtn{background:transparent;border:1px solid var(--cyan);color:var(--deep);
+padding:8px 14px;border-radius:2px;cursor:pointer;font-size:12px;
+letter-spacing:.12em;text-transform:uppercase;font-weight:600;
+font-family:"Barlow Condensed","Segoe UI",sans-serif;text-decoration:none;
+display:none}
+a.dlbtn:hover{background:var(--tint);border-color:var(--cyandark)}
+a.dlbtn.show{display:inline-block}
 #spark{font-size:11px;color:var(--mut)}
 #report,#livereport{white-space:pre-wrap;font:12px/1.5 Consolas,monospace;padding:12px;
 display:none;max-height:340px;overflow-y:auto;border-top:1px solid var(--line);
@@ -1155,6 +1490,12 @@ color:var(--deep);font-weight:700;letter-spacing:.12em;margin-bottom:8px;font-si
 #incidents li span{color:var(--mut)}
 #viewwrap{position:relative;margin:12px;border-radius:10px;overflow:hidden;
 background:#0d1418;border:1px solid var(--line)}
+#viewwrap.blanked #view{visibility:hidden}
+#viewBlank{display:none;position:absolute;inset:0;z-index:2;
+align-items:center;justify-content:center;text-align:center;padding:0 40px;
+color:rgba(255,255,255,.55);font-size:13px;letter-spacing:.04em;
+background:#0d1418}
+#viewwrap.blanked #viewBlank{display:flex}
 #viewtag{position:absolute;right:12px;top:12px;background:rgba(0,0,0,.65);
 color:#fff;font-size:10px;letter-spacing:.16em;padding:3px 9px;border-radius:999px}
 #namechip{position:absolute;left:14px;top:12px;color:#fff;font-size:13px;
@@ -1212,6 +1553,10 @@ button.pill.on{border-color:var(--cyan);background:var(--tint);color:var(--deep)
 .circ svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:2;
 stroke-linecap:round;stroke-linejoin:round}
 #srcnow{font-size:11px;color:var(--mut);width:100%;text-align:center}
+#srctabs{display:flex;gap:8px;width:100%;justify-content:center}
+.tabbtn{font-weight:600;letter-spacing:.02em}
+.tabpanel{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;
+width:100%}
 #autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
 cursor:pointer}
 #autolbl input{accent-color:var(--cyan)}
@@ -1244,6 +1589,7 @@ cursor:pointer}
     <div id="viewwrap">
       <div id="banner">HAZARD</div>
       <img id="view" src="/stream.mjpg" alt="live stream">
+      <div id="viewBlank">Pick a camera or upload a video to begin</div>
       <span id="namechip">Site camera</span>
       <span id="viewtag">ANNOTATED</span>
       <div id="vidctl">
@@ -1253,15 +1599,33 @@ cursor:pointer}
       </div>
     </div>
     <div id="pills">
-      <div class="pillwrap dd" id="camdd" title="Camera device">
-        <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-        <span class="ddlabel" id="camlabel">scanning cameras…</span>
-        <svg class="chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-        <ul class="menu" id="cammenu"></ul>
+      <div id="srctabs">
+        <button class="pill tabbtn on" id="tab-camera" data-tab="camera">Live Camera</button>
+        <button class="pill tabbtn" id="tab-upload" data-tab="upload">Upload Video</button>
       </div>
-      <button class="iconbtn" id="rescan" title="Rescan for new cameras">
-        <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      </button>
+      <div class="tabpanel" id="panel-camera">
+        <div class="pillwrap dd" id="camdd" title="Camera device">
+          <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          <span class="ddlabel" id="camlabel">scanning cameras…</span>
+          <svg class="chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+          <ul class="menu" id="cammenu"></ul>
+        </div>
+        <button class="iconbtn" id="rescan" title="Rescan for new cameras">
+          <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+        <button class="pill" id="devcam" title="Stream this device's camera to the server for detection">
+          <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="11" r="3.2"/></svg>
+          Use this device camera</button>
+      </div>
+      <div class="tabpanel" id="panel-upload" style="display:none">
+        <button class="pill" id="upbtn" title="Run detection on a video file (loops)">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Upload video</button>
+        <input type="file" id="upfile" accept="video/*" hidden>
+        <button class="pill" id="stopvidbtn" title="Stop the uploaded video and return to standby">
+          <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          Stop video</button>
+      </div>
       <div class="pillwrap dd" id="viewdd" title="View">
         <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
         <span class="ddlabel" id="viewlabel">Annotated view</span>
@@ -1271,13 +1635,6 @@ cursor:pointer}
           <li data-v="/raw.mjpg" data-tag="DIRECT">Direct view</li>
         </ul>
       </div>
-      <button class="pill" id="devcam" title="Stream this device's camera to the server for detection">
-        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="11" r="3.2"/></svg>
-        Use this device camera</button>
-      <button class="pill" id="upbtn" title="Run detection on a video file (loops)">
-        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-        Upload video</button>
-      <input type="file" id="upfile" accept="video/*" hidden>
       <span id="srcnow"></span>
     </div>
     <div class="stats">
@@ -1299,6 +1656,9 @@ cursor:pointer}
       <div class="hzrow" id="hz-height">
         <div><div class="k">Height</div><div class="d">Worker at height near edge (experimental)</div></div>
         <span class="n" id="n-height">0</span></div>
+      <div class="hzrow" id="hz-ppe">
+        <div><div class="k">PPE</div><div class="d">Worker missing hardhat or safety vest</div></div>
+        <span class="n" id="n-ppe">0</span></div>
     </div>
     <h2>Alert log</h2>
     <ul id="log"><li>No alerts yet.</li></ul>
@@ -1307,6 +1667,9 @@ cursor:pointer}
     <h2>Safety report</h2>
     <div class="foot">
       <button id="reportbtn">Generate report</button>
+      <a id="dlpdf" class="dlbtn" href="/report?format=pdf">Download PDF</a>
+      <a id="dltxt" class="dlbtn" href="/report?format=txt">Download TXT</a>
+      <a id="dljson" class="dlbtn" href="/report?format=json">Download JSON</a>
       <label id="autolbl"><input type="checkbox" id="autooff" checked>
         auto-off camera when everyone closes</label>
       <label id="autolbl"><input type="checkbox" id="detailvoice" checked>
@@ -1319,6 +1682,7 @@ cursor:pointer}
 </main>
 <script>
 let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[],lastIncKey=null;
+let serverMode='camera',modeSynced=false;
 const $=id=>document.getElementById(id);
 const IC={
 cam:'<svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>',
@@ -1335,32 +1699,95 @@ $('flipbtn').onclick=async()=>{
     mirrored=d.mirror;
     $('flipbtn').classList.toggle('act',mirrored);}
   catch(e){}};
+let voiceGen=0;
+function stopVoiceNow(){ // flush the queue + cancel whichever engine is speaking
+  voiceGen++;  // a /tts fetch already in flight must not start playing after this
+  speech.q=[];speech.busy=false;
+  if(window.speechSynthesis)speechSynthesis.cancel();
+  if(currentAudio){currentAudio.pause();currentAudio=null;}}
 $('mutebtn').onclick=()=>{muted=!muted;
   $('mutebtn').innerHTML=muted?IC.volOff:IC.vol;
   $('mutebtn').classList.toggle('off',muted);
-  if(muted&&window.speechSynthesis){
-    speech.q=[];speech.busy=false;speechSynthesis.cancel();} // stop + flush
+  if(muted)stopVoiceNow();
   if(!muted)say('Voice alerts enabled',{pri:3,ttl:3000});};
+// Voice pick: browsers load voices asynchronously and often default to a
+// low-quality/robotic one (espeak on bare Linux) even when better ones are
+// installed. Prefer a named "premium"/neural voice, then any local English
+// voice, then whatever the browser hands us — never block on this.
+let bestVoice=null;
+function pickVoice(){
+  if(!window.speechSynthesis)return;
+  const voices=speechSynthesis.getVoices();
+  if(!voices.length)return;
+  const scored=voices.map(v=>{
+    const n=v.name.toLowerCase();
+    let score=0;
+    if(/natural|neural|premium|enhanced|siri|google/.test(n))score+=3;
+    if(v.localService)score+=1;
+    if(v.lang&&v.lang.toLowerCase().startsWith('en'))score+=1;
+    if(/espeak|mbrola|generic/.test(n))score-=3;
+    return {v,score};
+  });
+  scored.sort((a,b)=>b.score-a.score);
+  bestVoice=scored[0].v;
+}
+if(window.speechSynthesis){
+  pickVoice();
+  speechSynthesis.onvoiceschanged=pickVoice;
+}
 // Priority speech queue: an utterance always finishes its sentence; the
 // next one waits its turn; anything that sat unspoken past its ttl is
-// dropped (a stale alarm is noise, not information).
+// dropped (a stale alarm is noise, not information). Elegant "on the spot"
+// fix (2026-07-19): rather than speaking a backlog one utterance at a time
+// (which reads as delayed/queued once more than one alert is waiting),
+// pumpSpeech drains and combines EVERY currently-queued item at the top
+// priority into one sentence each time it's ready to speak — a burst of
+// alerts becomes one slightly longer sentence, not a growing queue.
 const speech={q:[],busy:false};
+let currentAudio=null;
+let ttsAvailable=true;  // optimistic; flips false permanently on first /tts failure
 function say(text,opts){
-  if(muted||!window.speechSynthesis)return;
+  if(muted)return;
   const o=opts||{};
-  speech.q.push({text,pri:o.pri||2,exp:Date.now()+(o.ttl||8000)});
+  speech.q.push({text,pri:o.pri||2,exp:Date.now()+(o.ttl||6000)});
   pumpSpeech();}
-function pumpSpeech(){
+function stripPrefix(t){return t.replace(/^(Warning!|Caution!)\\s*/,'');}
+async function pumpSpeech(){
   if(speech.busy)return;
   const now=Date.now();
   speech.q=speech.q.filter(i=>i.exp>now);
   if(!speech.q.length)return;
   speech.q.sort((a,b)=>b.pri-a.pri);
-  const item=speech.q.shift();
+  const topPri=speech.q[0].pri;
+  const batch=[];
+  while(speech.q.length&&speech.q[0].pri===topPri)batch.push(speech.q.shift());
+  const text=batch.length===1?batch[0].text:
+    batch.length+' hazards. '+batch.map(b=>stripPrefix(b.text)).join(' Also, ');
   speech.busy=true;
-  const u=new SpeechSynthesisUtterance(item.text);
-  u.rate=1.08;u.pitch=1;u.volume=1;
-  u.onend=u.onerror=()=>{speech.busy=false;setTimeout(pumpSpeech,250);};
+  const myGen=voiceGen;  // if stopVoiceNow() runs while we're mid-fetch (e.g. a tab
+  const stale=()=>myGen!==voiceGen;  // switch), this utterance must not start playing after
+  const next=()=>{speech.busy=false;currentAudio=null;setTimeout(pumpSpeech,400);};
+  if(ttsAvailable){
+    try{
+      const r=await fetch('/tts?text='+encodeURIComponent(text));
+      if(stale()){speech.busy=false;return;}
+      if(!r.ok)throw new Error('no server voice');
+      const blob=await r.blob();
+      if(stale()){speech.busy=false;return;}
+      const audio=new Audio(URL.createObjectURL(blob));
+      currentAudio=audio;
+      audio.onended=audio.onerror=next;
+      await audio.play();
+      return;
+    }catch(e){if(stale()){speech.busy=false;return;} ttsAvailable=false;}
+    // this session: always use the browser voice from here on (genuine failure, not a stale fetch)
+  }
+  if(stale()){speech.busy=false;return;}
+  if(!window.speechSynthesis){speech.busy=false;return;}
+  const u=new SpeechSynthesisUtterance(text);
+  if(bestVoice)u.voice=bestVoice;
+  u.rate=1.0;u.pitch=1.0;u.volume=1;
+  u.onend=u.onerror=next;
   speechSynthesis.speak(u);}
 function fmtUp(s){return s>=3600?(s/3600).toFixed(1)+'h':s>=60?(s/60).toFixed(0)+'m':s.toFixed(0)+'s';}
 async function poll(){
@@ -1372,7 +1799,7 @@ async function poll(){
     $('vehicles').textContent=d.vehicles;
     $('uptime').textContent=fmtUp(d.uptime_sec);
     let total=0;
-    for(const k of['proximity','vehicle','height']){
+    for(const k of['proximity','vehicle','height','ppe']){
       const c=d.alert_counts[k]||0;total+=c;
       $('n-'+k).textContent=c;
       $('hz-'+k).classList.toggle('active',d.active_hazards.includes(k));}
@@ -1390,8 +1817,8 @@ async function poll(){
         log.appendChild(li);});
       const fresh=d.recent_alerts.filter(a=>a.time>lastAlert);
       if(fresh.length){
-        if(lastAlert>0) // don't replay history on page load
-          fresh.forEach(a=>say(a.message,{pri:2,ttl:7000}));
+        if(lastAlert>0) // don't replay history on page load — pumpSpeech
+          fresh.forEach(a=>say(a.message,{pri:2}));   // batches any backlog itself
         lastAlert=fresh[fresh.length-1].time;}
     }
     if(d.incidents&&d.incidents.length){
@@ -1421,11 +1848,37 @@ async function poll(){
         camSelected=d.source;renderCamMenu();}
       if(!$('srcnow').textContent.startsWith('Switching'))
         $('srcnow').textContent=(d.camera_on?'live':'camera off')
-          +'  ·  viewers: '+d.viewers;}
+          +'  ·  viewers: '+d.viewers;
+      // Ground truth for "is a tab click actually changing anything" — a
+      // client-only guess (e.g. a variable defaulting to 'camera' on every
+      // fresh page load) goes stale the moment a video's been left running
+      // from an earlier session, so clicking the already-highlighted Live
+      // Camera tab silently did nothing. This tracks the server's own idea
+      // of the mode instead. Also syncs which tab is VISIBLE the first time
+      // (page load / refresh) so a page opened onto a playing upload shows
+      // the Upload tab, not a stale default.
+      const trueMode=(digit||d.source==='browser')?'camera':'upload';
+      if(!modeSynced){selectTab(trueMode);modeSynced=true;}
+      serverMode=trueMode;}
     if(d.camera_on!==undefined){
       camOn=d.camera_on;
       $('cambtn').innerHTML=camOn?IC.cam:IC.camOff;
-      $('cambtn').classList.toggle('off',!camOn);}
+      $('cambtn').classList.toggle('off',!camOn);
+      // Server truth, checked every poll — covers the tab-switch instant
+      // blank AND auto-off AND a manual toggle with one rule, rather than
+      // waiting for the MJPEG stream to eventually deliver a placeholder
+      // frame (up to ~1s lag) to visually reflect "nothing is active".
+      $('viewwrap').classList.toggle('blanked',!camOn);
+      if(!camOn){
+        // Distinguish "a camera is armed, one more click starts it" from
+        // "nothing picked yet" — a generic message in both cases (2026-07-19
+        // user confusion) left it unclear that the recommended camera was
+        // already selected and just needed the camera button pressed.
+        const armedCam=camList.find(c=>String(c.index)===camSelected&&c.usable!==false);
+        $('viewBlank').textContent=armedCam
+          ?'Camera ready ('+armedCam.label.split(' — ')[0]+') — press the camera button below to start'
+          :'Pick a camera or upload a video to begin';}
+      maybeAutoArmOnLoad();}
     if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
       $('autooff').checked=d.auto_off;
     if(d.mirror!==undefined){mirrored=d.mirror;
@@ -1452,6 +1905,11 @@ function renderCamMenu(){
   const menu=$('cammenu');menu.innerHTML='';
   camList.forEach(c=>{const li=document.createElement('li');
     li.dataset.i=String(c.index);li.textContent=c.label;
+    // Labeling a bad entry "not usable" wasn't foolproof enough on its own
+    // (2026-07-19) — reuse the same "none" class the empty-list placeholder
+    // already uses, which the click handler below already ignores, so a
+    // known-non-color node genuinely can't be selected, not just discouraged.
+    if(c.usable===false)li.classList.add('none');
     if(String(c.index)===camSelected)li.classList.add('sel');
     menu.appendChild(li);});
   if(!camList.length){const li=document.createElement('li');
@@ -1459,7 +1917,39 @@ function renderCamMenu(){
     menu.appendChild(li);}
   const cur=camList.find(c=>String(c.index)===camSelected);
   if(cur)$('camlabel').textContent=cur.label;
-  else if(!camList.length)$('camlabel').textContent='no camera found';}
+  else if(!camList.length)$('camlabel').textContent='no camera found';
+  // Bug (2026-07-19): with cameras found but none picked yet, neither branch
+  // above matched, so the label stayed stuck on its initial HTML placeholder
+  // "scanning cameras…" forever — looked like it was perpetually scanning
+  // even though the scan had long since finished and options were ready.
+  else $('camlabel').textContent=camList.length+' camera'+(camList.length>1?'s':'')+' found — pick one';}
+// Arms (points `current` at, without opening) the first usable=true camera
+// — the same one the dropdown already sorts to the top and marks
+// "(recommended)". Returns true if one existed to arm. Used both when
+// entering the Camera tab and once on initial page load, so a fresh server
+// (armed to whatever raw index --source defaulted to, often wrong for a
+// multi-stream camera) starts pointed at the right device before the user
+// ever presses camera-on, not after.
+async function armRecommendedCamera(){
+  const usable=camList.filter(c=>c.usable!==false);
+  if(!usable.length)return false;
+  const rec=usable[0];
+  camSelected=String(rec.index);renderCamMenu();
+  try{await fetch('/arm?src='+encodeURIComponent(rec.index));}catch(e){}
+  return true;
+}
+let autoArmed=false;
+function maybeAutoArmOnLoad(){
+  // Only touch things while genuinely idle: camera mode, nothing already
+  // streaming, and not already pointed at a usable camera (don't fight a
+  // deliberate earlier choice this session).
+  if(autoArmed||!modeSynced||serverMode!=='camera'||camOn)return;
+  const usable=camList.filter(c=>c.usable!==false);
+  if(!usable.length)return;
+  if(usable.some(c=>String(c.index)===camSelected)){autoArmed=true;return;}
+  autoArmed=true;
+  armRecommendedCamera();
+}
 async function loadCams(refresh){
   if(refresh)$('rescan').classList.add('spin');
   try{const r=await fetch('/cameras'+(refresh?'?refresh=1':''));
@@ -1469,6 +1959,7 @@ async function loadCams(refresh){
       fresh.filter(c=>!known.has(c.index)).forEach(c=>{
         $('srcnow').textContent='New camera detected: '+c.label;});}
     camList=fresh;renderCamMenu();
+    maybeAutoArmOnLoad();
   }catch(e){}
   $('rescan').classList.remove('spin');}
 loadCams();
@@ -1538,7 +2029,61 @@ $('upfile').onchange=()=>{
   xhr.onerror=()=>{$('srcnow').textContent='Upload failed.';};
   $('srcnow').textContent='Uploading '+f.name+' …';
   xhr.send(f);
-  $('upfile').value='';};
+  $('upfile').value='';
+  selectTab('upload');};
+$('stopvidbtn').onclick=async()=>{
+  try{await fetch('/camera?on=0');
+    $('srcnow').textContent='Video stopped — pick a camera or upload another clip.';}
+  catch(e){}};
+// Camera and Upload are two distinct modes. Switching tabs stops whatever
+// the mode you're LEAVING was actually doing on the SERVER (2026-07-19:
+// leaving an uploaded video running in the background after switching to
+// Live Camera was confusing — "why can I still hear it" — so the switch
+// itself tears it down). Compared against serverMode (synced from /events
+// every poll), not a client-only guess — a plain click-tracked variable
+// defaults to 'camera' on every fresh page load even when a video is
+// already playing from an earlier session, so clicking the
+// already-highlighted Live Camera tab would silently do nothing.
+function selectTab(name){
+  document.querySelectorAll('.tabbtn').forEach(b=>
+    b.classList.toggle('on',b.dataset.tab===name));
+  $('panel-camera').style.display=name==='camera'?'flex':'none';
+  $('panel-upload').style.display=name==='upload'?'flex':'none';
+}
+document.querySelectorAll('.tabbtn').forEach(btn=>
+  btn.onclick=async()=>{
+    const target=btn.dataset.tab;
+    selectTab(target);
+    if(serverMode!==target){
+      stopDevCam();
+      stopVoiceNow();           // an alert from the mode you're leaving must not keep talking
+      $('viewwrap').classList.add('blanked');  // instant — don't wait for the server's
+      $('view').alt='';                        // placeholder frame to arrive over MJPEG
+      // New mode, new session — old counts/log/report from a different
+      // video or camera would otherwise sit there looking current.
+      $('log').innerHTML='<li>No alerts yet.</li>';
+      $('incidents').innerHTML='<li>Scene notes appear here seconds after an alert fires.</li>';
+      $('livereport').style.display='none';$('livereport').textContent='';
+      $('banner').classList.remove('on');
+      for(const k of['proximity','vehicle','height','ppe']){
+        $('n-'+k).textContent='0';$('hz-'+k).classList.remove('active');}
+      $('alerts').textContent='0';$('workers').textContent='0';$('vehicles').textContent='0';
+      lastAlert=Date.now()/1000;lastIncKey=null;
+      // Entering Camera: arm the recommended camera in ONE decisive call
+      // instead of a bare /camera?on=0 (2026-07-19 bugs, both from the same
+      // root cause — /camera?on=0 stops whatever was running but leaves
+      // `current` untouched): (1) pressing camera-on afterward used to
+      // resume the stale uploaded video, or the raw startup default index
+      // (often the wrong node on a multi-stream camera like RealSense), not
+      // the dropdown's recommended camera; (2) selecting a camera right
+      // after switching could race this call's own async response, which
+      // could land after and turn the just-started camera back off. /arm
+      // both fixes `current` and removes the second stop-call entirely.
+      if(target==='camera' && await armRecommendedCamera()){/* armed */}
+      else{try{await Promise.all([fetch('/camera?on=0'),fetch('/reset')]);}catch(e){}}
+      $('srcnow').textContent='';
+      serverMode=target;
+    }});
 $('cambtn').onclick=async()=>{
   try{const r=await fetch('/camera?on='+(camOn?0:1));const d=await r.json();
     camOn=d.camera_on;
@@ -1549,8 +2094,10 @@ $('autooff').onchange=()=>fetch('/camera?auto='+($('autooff').checked?1:0));
 $('reportbtn').onclick=async()=>{
   const box=$('report');box.style.display='block';
   box.textContent='Generating safety report on the Spark…';
-  try{const r=await fetch('/report');box.textContent=await r.text();}
-  catch(e){box.textContent='Report request failed: '+e;}};
+  try{
+    const r=await fetch('/report');box.textContent=await r.text();
+    if(r.ok){['dlpdf','dltxt','dljson'].forEach(id=>$(id).classList.add('show'));}
+  }catch(e){box.textContent='Report request failed: '+e;}};
 setInterval(poll,1000);poll();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
@@ -1593,6 +2140,10 @@ def parse_args():
                    default=config.HEIGHT_ZONE_ENABLED,
                    help="Also enable the absolute upper-zone height rule "
                         "(the relative worker-vs-worker check is always on)")
+    p.add_argument("--no-ppe", action="store_true",
+                   help="Disable the PPE_Detect model: no baseline PPE-"
+                        "compliance hazard, and height alarms always fire "
+                        "(the hardhat cross-check can never pass)")
     return p.parse_args()
 
 
@@ -1604,6 +2155,19 @@ def main():
     detector = build_detector(args)
     print(f"[live] detector: {getattr(detector, 'label', 'Plan A')}")
     print(f"[live] Ollama (Spark): {config.OLLAMA_HOST}")
+
+    ppe_detector = None
+    if config.PPE_ENABLED and not args.no_ppe:
+        if config.PPE_MODEL_PATH.exists():
+            from detectors import PPEDetector
+            ppe_detector = PPEDetector(str(config.PPE_MODEL_PATH), device=args.device).load()
+            print(f"[live] PPE detector: {config.PPE_MODEL_PATH}")
+        else:
+            print(f"[live] PPE detector disabled — weights not found at "
+                  f"{config.PPE_MODEL_PATH} (no baseline PPE hazard; height "
+                  "alarms will always fire, never suppressed)")
+
+    tts_voice = load_tts_voice()
 
     player = AudioPlayer() if (args.audio and not args.no_audio) else None
     engine = AlertEngine(player=player)
@@ -1628,14 +2192,14 @@ def main():
 
     analyst = None
     if not args.no_analysis:
-        analyst = IncidentAnalyst(state, engine)
+        analyst = IncidentAnalyst(state, engine, ppe_detector=ppe_detector)
         analyst.start()
 
     stop_flag = threading.Event()
     det_thread = threading.Thread(
         target=detection_loop,
         args=(args, detector, in_slot, out_slot, state, engine, stop_flag, analyst,
-              raw_slot),
+              raw_slot, ppe_detector),
         daemon=True)
     det_thread.start()
 
@@ -1658,7 +2222,7 @@ def main():
                              daemon=True).start()
             server = ThreadingHTTPServer(("0.0.0.0", args.port),
                                          make_handler(out_slot, state, sources,
-                                                      raw_slot, in_slot))
+                                                      raw_slot, in_slot, tts_voice))
             print(f"[live] dashboard:  http://{local_ip()}:{args.port}")
             print(f"[live] MJPEG feed: http://{local_ip()}:{args.port}/stream.mjpg")
             print("[live] Ctrl+C to stop")

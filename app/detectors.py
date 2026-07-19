@@ -323,6 +323,42 @@ class PlanEDetector(BaseDetector):
                 "detections": detections}
 
 
+class PPEDetector:
+    """Wraps PPE_Detect/best.pt (Roboflow-style Hardhat/Safety Vest/boots/
+    gloves detector) used by live.py for the baseline PPE-compliance hazard
+    and the height-alarm cross-check. Not a worker/vehicle Plan, so it stays
+    out of DETECTOR_REGISTRY — live.py loads it directly by path."""
+
+    def __init__(self, weights_path: str, device: str = "0"):
+        self.weights_path = str(weights_path)
+        self.device = device
+        self.model = None
+        self.names: dict[int, str] = {}
+
+    def load(self):
+        from ultralytics import YOLO
+        self.model = YOLO(self.weights_path)
+        self.names = self.model.names
+        return self
+
+    def predict(self, frame, conf: float, imgsz: int = 416) -> list[dict]:
+        """Returns [{'name': str, 'conf': float, 'xyxy': (x1,y1,x2,y2)}, ...]
+        using the model's own class names — never hardcode its class ids,
+        they're specific to this weight file."""
+        quantize = "fp16" if self.device != "cpu" else None
+        result = self.model.predict(
+            frame, imgsz=imgsz, conf=conf, device=self.device, quantize=quantize, verbose=False
+        )[0]
+        out = []
+        if result.boxes is not None:
+            for box in result.boxes:
+                cls_id = int(box.cls.item())
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+                out.append({"name": self.names.get(cls_id, str(cls_id)),
+                           "conf": float(box.conf.item()), "xyxy": (x1, y1, x2, y2)})
+        return out
+
+
 DETECTOR_REGISTRY: dict[str, type[BaseDetector]] = {
     PlanADetector.label: PlanADetector,
     PlanBDetector.label: PlanBDetector,
