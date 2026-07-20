@@ -10,14 +10,31 @@ if the server or every model is unavailable, so the app never crashes.
 """
 
 # Static safety reference snippets injected into the prompt so the report
-# grounds its recommendations in named rules instead of generic advice.
+# grounds its recommendations in named Malaysian OSH legislation/guidelines
+# instead of generic or foreign-jurisdiction advice (2026-07-20: this project
+# is for a Malaysian construction site, and a report that cites US OSHA/ISO
+# standards instead of Malaysian law reads as less credible/valid to a local
+# reviewer, DOSH inspector, or CIDB auditor than one grounded in the actual
+# legislation that applies on site).
 SAFETY_REFERENCES = """\
-- OSHA 1926.601 / ISO 5006: earthmoving machinery must maintain visibility of \
-workers; reversing vehicles require a spotter or functioning alarm.
-- Exclusion zone practice: a minimum 5 m clearance between workers on foot and \
-operating heavy machinery; barriers or marked zones where practical.
-- PDPA data minimization: monitoring records must avoid storing identifiable \
-worker imagery; retain only aggregate counts and event timestamps."""
+- Occupational Safety and Health Act 1994 (Act 514): the employer's general \
+duty to ensure, so far as practicable, the safety and health of all persons \
+at work; the employee's duty to use PPE provided and to take reasonable care \
+for their own and others' safety.
+- Factories and Machinery Act 1967 (Act 139) and the Factories and Machinery \
+(Safety Helmets) Regulations 1970: safety helmets are mandatory on site for \
+all workers and visitors in areas with overhead or falling-object risk.
+- DOSH (Department of Occupational Safety and Health Malaysia) Guidelines on \
+Occupational Safety and Health in Construction Industry (Management), OSHCIM: \
+marked exclusion zones around operating plant/machinery, a banksman/signaller \
+for reversing or slewing equipment, and fall-prevention measures for work at \
+height.
+- CIDB (Construction Industry Development Board Malaysia), under the CIDB \
+Malaysia Act 1994 (Act 520): all site workers are required to hold a valid \
+Green Card (mandatory safety induction) before working on site.
+- Personal Data Protection Act 2010 (PDPA) (Act 709): monitoring records must \
+avoid storing identifiable worker imagery; retain only aggregate counts and \
+event timestamps."""
 
 
 def _severity(report: dict) -> str:
@@ -83,7 +100,9 @@ def _format_incident_notes(report: dict) -> str:
 
 
 def _build_prompt(report: dict) -> str:
-    return f"""You are a certified construction site safety officer writing a formal site safety report about footage reviewed from a construction site. Write about the SITE and the WORKERS — what happened, where the danger was, when. Do NOT mention AI, models, detection systems, algorithms, video analysis software, or how the footage was processed. Be direct and specific. No filler, no hedging.
+    return f"""You are a certified construction site safety officer in Malaysia writing a formal site safety report about footage reviewed from a construction site, for a report that must be valid and credible under Malaysian occupational safety and health law. Write about the SITE and the WORKERS — what happened, where the danger was, when. Do NOT mention AI, models, detection systems, algorithms, video analysis software, or how the footage was processed. Do NOT cite foreign standards (e.g. US OSHA, ISO) — use only the Malaysian Acts, regulations, and DOSH/CIDB guidelines listed below. Be direct and specific. No filler, no hedging.
+
+This report must be CONCISE — every section has a hard length limit below. Stay within it; a short, complete report is required, not a truncated long one.
 
 SITE OBSERVATIONS (authoritative — use these facts):
 - Footage: {report.get('video', 'unknown')}, {report.get('frames_processed', 0)} frames reviewed
@@ -92,7 +111,7 @@ SITE OBSERVATIONS (authoritative — use these facts):
 - Assessed severity: {_severity(report)}
 
 UNSAFE PROXIMITY LOG (worker too close to operating heavy machinery):
-{_format_events(report)}
+{_format_events(report, limit=3)}
 {_format_incident_notes(report)}
 SAFETY REFERENCES (cite these where relevant):
 {SAFETY_REFERENCES}
@@ -104,16 +123,16 @@ Produce EXACTLY this Markdown structure, filling in content:
 **Severity: {_severity(report)}**
 
 ### 1. Summary
-(2-3 direct sentences about site conditions: workers operating alongside heavy machinery, how many unsafe proximity intervals occurred and their overall pattern.)
+(EXACTLY 1-2 sentences: site conditions and the overall proximity-hazard pattern.)
 
 ### 2. Hazards Identified
-(Bullet list from the proximity log: each bullet states when, for how long, and that a worker was inside the unsafe zone of operating machinery. If none, one line stating no unsafe proximity was observed.)
+(Up to 3 bullets from the proximity log, one line each — when, how long, unsafe zone. If none, one line stating no unsafe proximity was observed.)
 
 ### 3. Recommended Actions
-(Numbered list, most urgent first. Concrete site actions — exclusion zones, spotters, alarms, briefings — citing the safety references.)
+(Top 2-3 only, most urgent first, one line each. Concrete site actions citing the specific Malaysian Act/Regulation/DOSH guideline it comes from, by name, from the safety references above. Do not invent section or clause numbers not given above.)
 
 ### 4. Data Protection Note
-(One short paragraph: this report stores no worker identity or imagery, only aggregate counts and event timestamps, per PDPA data minimization.)
+(EXACTLY one sentence: this report stores no worker identity or imagery, only aggregate counts and event timestamps, in line with the Personal Data Protection Act 2010 (PDPA) (Act 709).)
 
 Output only the report. Nothing before or after it."""
 
@@ -144,13 +163,14 @@ def _fallback_report(report: dict) -> str:
 {hazard_section}
 
 ### 3. Recommended Actions
-1. Establish and enforce a marked exclusion zone of at least 5 m between workers on foot and operating machinery (exclusion zone practice).
-2. Assign a dedicated spotter for reversing and slewing machinery and verify reversing alarms function (OSHA 1926.601 / ISO 5006).
-3. Review the flagged intervals with the site supervisor and the workers involved.
-4. Reinforce machinery proximity rules at the next toolbox talk.
+1. Establish and enforce a marked exclusion zone between workers on foot and operating machinery, per DOSH's Guidelines on Occupational Safety and Health in Construction Industry (Management) (OSHCIM).
+2. Assign a dedicated banksman/signaller for reversing and slewing machinery, per OSHCIM plant and machinery provisions.
+3. Confirm all workers on site hold a valid CIDB Green Card, per the CIDB Malaysia Act 1994 (Act 520).
+4. Review the flagged intervals with the site supervisor and the workers involved, per the employer's general duty of care under the Occupational Safety and Health Act 1994 (Act 514).
+5. Reinforce machinery proximity rules at the next toolbox talk.
 
 ### 4. Data Protection Note
-This report contains no worker identity or imagery. Only aggregate counts and event timestamps are recorded, in line with PDPA data minimization principles.
+This report contains no worker identity or imagery. Only aggregate counts and event timestamps are recorded, in line with the Personal Data Protection Act 2010 (PDPA) (Act 709).
 """
 
 

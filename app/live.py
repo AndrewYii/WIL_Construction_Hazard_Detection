@@ -27,6 +27,7 @@ import math
 import queue
 import random
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -321,7 +322,10 @@ def parse_source(raw: str):
 
 def public_source(src) -> str:
     """What the HTTP API may reveal about the current source: camera index,
-    URL host, or file basename — never a filesystem path or full URL."""
+    URL host, or file basename — never a filesystem path or full URL.
+    None (nothing armed, e.g. after disarm()) is reported as ''."""
+    if src is None:
+        return ""
     s = str(src)
     if isinstance(src, int) or s.isdigit():
         return s
@@ -363,10 +367,45 @@ class SourceManager:
 
     def arm(self, source, loop_file: bool = False):
         """Remember the source without opening the device (standby): the
-        camera stays off until someone presses the camera button."""
+        camera stays off until someone presses the camera button.
+
+        Must also stop whatever capture is currently running (2026-07-20,
+        real bug): entering the Camera tab while an uploaded video's
+        CaptureThread was actively running called this without ever
+        stopping it — `current`/`camera_on` updated correctly (so the UI
+        correctly showed "camera off, press to start"), but the video kept
+        looping, feeding frames, and firing genuinely new-timestamped
+        alerts into the freshly-cleared log the whole time, invisible only
+        because the client's `blanked` CSS class hides the still-updating
+        MJPEG view behind a placeholder. `start()` and `use_browser()`
+        already stop the previous capture before doing anything else —
+        `arm()` only skipped OPENING a new device (the actual consent-model
+        point of arming vs. starting), it was never meant to also skip
+        stopping the old one."""
         with self._lock:
+            if self.capture and self.capture.is_alive():
+                self.capture.close_on_exit = False
+                self.capture.stop_flag.set()
+            self.capture = None
             self.current = source
             self._loop_file = loop_file
+            self.camera_on = False
+
+    def disarm(self):
+        """Forget the remembered source entirely. Companion to arm() for the
+        failure case (2026-07-20): entering Camera mode found no usable
+        camera to arm, and the old fallback (just /camera?on=0) left
+        `current` pointed at whatever was active before — typically an
+        uploaded video — so the next camera-on press silently resumed that
+        video instead of doing nothing. After disarm(), camera-on is a
+        no-op until something explicitly arms/starts a real source again."""
+        with self._lock:
+            if self.capture and self.capture.is_alive():
+                self.capture.close_on_exit = False
+                self.capture.stop_flag.set()
+            self.capture = None
+            self.current = None
+            self._loop_file = False
             self.camera_on = False
 
     def use_browser(self):
@@ -399,17 +438,6 @@ class SourceManager:
         with self._lock:
             if self.capture:
                 self.capture.stop_flag.set()
-
-    @property
-    def is_file_source(self) -> bool:
-        """True while the current source is a looping uploaded video, not a
-        live camera/RTSP/browser feed. The meeting-style privacy auto-off
-        exists to dim a webcam's LED when nobody's watching — it must not
-        also kill an uploaded video's playback just because the tab was
-        briefly closed (e.g. mid page-refresh), which used to freeze the
-        stream on a permanent "camera off" placeholder with no way back
-        short of manually toggling the camera button."""
-        return self._loop_file
 
 
 # --------------------------------------------------------------------------
@@ -473,10 +501,10 @@ class SessionState:
         self.incidents: list[dict] = []   # VLM scene notes per fired alert
         self.live_report: str = ""        # auto-refreshed LLM report
         self.viewers = 0                  # open MJPEG connections
-        self.auto_off = True              # camera auto-off when last viewer leaves
         self.mirror = False               # horizontal flip (front-facing cameras)
         self.height_flash_until = 0.0     # banner window after verified height alert
         self.session_epoch = 0            # bumped by reset_session() — see IncidentAnalyst
+        self.detector_error: str | None = None  # last inference failure; cleared on next good frame
 
     def reset_session(self):
         """A new source (upload, camera switch, or a tab change that stops
@@ -499,6 +527,7 @@ class SessionState:
             self.live_report = ""
             self.height_flash_until = 0.0
             self.session_epoch += 1  # any in-flight analyst job from before this must be discarded
+            self.detector_error = None
         self.engine.reset()
 
     def snapshot(self) -> dict:
@@ -519,8 +548,8 @@ class SessionState:
                 "incidents": self.incidents[-8:],
                 "live_report": self.live_report,
                 "viewers": self.viewers,
-                "auto_off": self.auto_off,
                 "mirror": self.mirror,
+                "detector_error": self.detector_error,
             }
 
     def to_report_dict(self) -> dict:
@@ -876,7 +905,26 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         if raw_slot is not None:
             raw_slot.put(frame.copy())  # untouched view, before drawing
 
-        detections = detector.predict_frame(frame, conf=args.conf, imgsz=args.imgsz)
+        try:
+            detections = detector.predict_frame(frame, conf=args.conf, imgsz=args.imgsz)
+        except Exception as exc:
+            # The pipeline must never crash because of a transient inference
+            # failure (2026-07-20: a CUDA OOM here — caused by a warm Ollama
+            # model still holding unified memory on this Grace-Blackwell
+            # Spark, see the Gotchas entry — killed this whole thread with an
+            # unhandled exception. Nothing restarts a dead thread, so the
+            # dashboard was stuck on the standby placeholder forever
+            # afterward, looking exactly like an unarmed-camera bug even
+            # though the camera and source-switching logic were both fine).
+            # Surface it distinctly (state.detector_error) instead of
+            # silently dying, back off briefly so a persistent failure
+            # doesn't spin the loop, and keep trying the next frame.
+            print(f"[live] detector.predict_frame failed, retrying next frame: {exc!r}",
+                  flush=True)
+            with state.lock:
+                state.detector_error = str(exc)
+            time.sleep(1.0)
+            continue
 
         # --- hazard layer -------------------------------------------------
         hazard_pairs = find_proximity_hazards(
@@ -926,8 +974,17 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         if ppe_detector is not None and (worker_just_appeared
                 or t0 - last_ppe_check >= config.PPE_CHECK_INTERVAL_SEC):
             last_ppe_check = t0
-            ppe_dets = ppe_detector.predict(frame, conf=config.PPE_CONF, imgsz=args.imgsz)
-            ppe_violations = find_ppe_violations(workers, ppe_dets)
+            try:
+                ppe_dets = ppe_detector.predict(frame, conf=config.PPE_CONF, imgsz=args.imgsz)
+                ppe_violations = find_ppe_violations(workers, ppe_dets)
+            except Exception as exc:
+                # Same "never crash the thread" contract as the main
+                # detector call above — held-over ppe_violations from the
+                # last good pass keep showing rather than the loop dying.
+                print(f"[live] PPE_Detect pass failed, keeping last verdict: {exc!r}",
+                      flush=True)
+                with state.lock:
+                    state.detector_error = str(exc)
         if ppe_violations and workers:
             active.add("ppe")
 
@@ -946,6 +1003,7 @@ def detection_loop(args, detector, in_slot: LatestFrame,
         inst_fps = 1.0 / dt if dt > 0 else 0.0
         fps_smooth = inst_fps if fps_smooth is None else fps_smooth * 0.9 + inst_fps * 0.1
         with state.lock:
+            state.detector_error = None  # this frame made it through fine
             state.frames += 1
             state.fps = fps_smooth
             state.workers_now = n_workers
@@ -1073,6 +1131,8 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                 self._reset()
             elif self.path.startswith("/arm"):
                 self._arm()
+            elif self.path.startswith("/disarm"):
+                self._disarm()
             else:
                 self.send_error(404)
 
@@ -1119,6 +1179,12 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             from urllib.parse import parse_qs, urlparse
             if parse_qs(urlparse(self.path).query).get("claim"):
                 sources.use_browser()
+                # Every other source-change entry point (/upload, /switch,
+                # /arm) calls this — claiming the browser camera was the one
+                # left out (2026-07-20 bug report: switching to "Use this
+                # device camera" kept the old source's alert log/voice/
+                # cooldown state alive instead of starting a clean session).
+                state.reset_session()
                 print("[live] source switched to: viewer device camera")
                 self._static('{"ok": true}', "application/json")
                 return
@@ -1180,16 +1246,13 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
                     # our placeholder — repaint it once things settle
                     threading.Timer(0.8, push_off).start()
                 print(f"[live] camera {'ON' if on else 'OFF'}")
-            if "auto" in qs:
-                with state.lock:
-                    state.auto_off = qs["auto"][0] == "1"
             if "mirror" in qs:
                 with state.lock:
                     state.mirror = qs["mirror"][0] == "1"
             with state.lock:
-                auto, mirror = state.auto_off, state.mirror
+                mirror = state.mirror
             body = json.dumps({"camera_on": sources.camera_on,
-                               "auto_off": auto, "mirror": mirror}).encode()
+                               "mirror": mirror}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1233,6 +1296,20 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
             body = json.dumps({"ok": bool(raw),
                                "source": public_source(sources.current)}).encode()
             self.send_response(200 if raw else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _disarm(self):
+            """Companion to /arm for the failure case: the dashboard calls
+            this when entering Camera mode found no usable camera to point
+            at, so `current` is cleared instead of left on the previous
+            source (see SourceManager.disarm)."""
+            sources.disarm()
+            state.reset_session()
+            body = json.dumps({"ok": True, "source": public_source(sources.current)}).encode()
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1358,30 +1435,6 @@ def make_handler(out_slot: LatestFrame, state: SessionState,
     return Handler
 
 
-def camera_watchdog(state: SessionState, sources: SourceManager,
-                    out_slot: LatestFrame, raw_slot: LatestFrame | None,
-                    grace_sec: float = 15.0):
-    """Meeting-style auto-off: when the last dashboard/stream viewer closes
-    and auto-off is enabled, release the camera after a grace period."""
-    zero_since = None
-    while True:
-        time.sleep(5)
-        with state.lock:
-            viewers, auto = state.viewers, state.auto_off
-        if viewers == 0 and auto and sources.camera_on and not sources.is_file_source:
-            zero_since = zero_since or time.time()
-            if time.time() - zero_since >= grace_sec:
-                sources.set_camera(False)
-                placeholder = camera_off_frame()
-                if raw_slot is not None:
-                    raw_slot.put(placeholder.copy())
-                out_slot.put(placeholder)
-                print("[live] no viewers — camera auto-off")
-                zero_since = None
-        else:
-            zero_since = None
-
-
 def local_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1441,6 +1494,10 @@ color:#fff;text-align:center;font-weight:700;letter-spacing:.14em;padding:10px;
 font-size:16px;display:none;text-transform:uppercase;z-index:2}
 #banner.on{display:block;animation:blink 1s steps(2) infinite}
 @keyframes blink{50%{background:rgba(120,10,5,.94)}}
+#detectorErr{position:absolute;left:0;right:0;top:42px;background:rgba(180,120,0,.94);
+color:#fff;text-align:center;font-weight:600;letter-spacing:.04em;padding:8px 12px;
+font-size:12px;display:none;z-index:2}
+#detectorErr.on{display:block}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
 border-top:1px solid var(--line)}
 .stat{background:#fff;padding:10px 12px;border-top:3px solid var(--cyan)}
@@ -1557,9 +1614,6 @@ stroke-linecap:round;stroke-linejoin:round}
 .tabbtn{font-weight:600;letter-spacing:.02em}
 .tabpanel{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;
 width:100%}
-#autolbl{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
-cursor:pointer}
-#autolbl input{accent-color:var(--cyan)}
 @media(max-width:640px){
   header{padding:10px 12px;gap:8px}
   header h1{font-size:14px;letter-spacing:.04em}
@@ -1588,6 +1642,7 @@ cursor:pointer}
   <section class="panel">
     <div id="viewwrap">
       <div id="banner">HAZARD</div>
+      <div id="detectorErr" title="The detector thread hit an error and is retrying — not a camera/source problem"></div>
       <img id="view" src="/stream.mjpg" alt="live stream">
       <div id="viewBlank">Pick a camera or upload a video to begin</div>
       <span id="namechip">Site camera</span>
@@ -1670,10 +1725,6 @@ cursor:pointer}
       <a id="dlpdf" class="dlbtn" href="/report?format=pdf">Download PDF</a>
       <a id="dltxt" class="dlbtn" href="/report?format=txt">Download TXT</a>
       <a id="dljson" class="dlbtn" href="/report?format=json">Download JSON</a>
-      <label id="autolbl"><input type="checkbox" id="autooff" checked>
-        auto-off camera when everyone closes</label>
-      <label id="autolbl"><input type="checkbox" id="detailvoice" checked>
-        speak AI scene details after alarms</label>
       <span id="spark">Spark: checking…</span>
     </div>
     <div id="livereport"></div>
@@ -1681,7 +1732,7 @@ cursor:pointer}
   </section>
 </main>
 <script>
-let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[],lastIncKey=null;
+let muted=false,lastAlert=0,alertTotal=0,camOn=true,camList=[];
 let serverMode='camera',modeSynced=false;
 const $=id=>document.getElementById(id);
 const IC={
@@ -1809,6 +1860,15 @@ async function poll(){
       banner.textContent='⚠ '+d.active_hazards.map(k=>d.hazard_labels[k]||k).join('  •  ');
       banner.classList.add('on');
     }else banner.classList.remove('on');
+    // Distinct from the camera/source state below: this means the detector
+    // thread itself is failing (e.g. a CUDA OOM from a warm Ollama model —
+    // see the Gotchas page) and retrying, not that no camera is armed. Shows
+    // up as "camera off"-looking (frozen/stuck) otherwise with no way to
+    // tell the two apart from the dashboard alone (2026-07-20).
+    const derr=$('detectorErr');
+    if(d.detector_error){derr.textContent='⚠ Detector error, retrying: '+d.detector_error;
+      derr.classList.add('on');}
+    else derr.classList.remove('on');
     if(d.recent_alerts.length){
       const log=$('log');log.innerHTML='';
       [...d.recent_alerts].reverse().forEach(a=>{
@@ -1828,21 +1888,14 @@ async function poll(){
         li.innerHTML='<b>'+(n.type||'').toUpperCase()+'</b> <span>'+n.iso+'</span><br>'
                      +(n.note||'');
         inc.appendChild(li);});
-      // follow-up voice: read the VLM scene note aloud once it lands
-      // (queued, so it never cuts off the instant alarm phrase)
-      const nw=d.incidents[d.incidents.length-1];
-      const key=nw.iso+nw.type+(nw.note||'');
-      if(lastIncKey!==null&&key!==lastIncKey&&$('detailvoice').checked
-         &&nw.note&&nw.note!=='scene review unavailable')
-        say('Detail: '+nw.note.slice(0,220),{pri:1,ttl:20000});
-      lastIncKey=key;
     }
     if(d.source!==undefined){
       const digit=/^[0-9]+$/.test(d.source);
       const cam=digit?camList.find(c=>String(c.index)===d.source):null;
-      const label=cam?cam.label:(digit?'Camera '+d.source
-        :(d.source==='browser'?'Device camera (streamed)'
-          :d.source.split(/[\\/]/).pop()));
+      const label=d.source===''?'no camera armed'
+        :cam?cam.label:(digit?'Camera '+d.source
+          :(d.source==='browser'?'Device camera (streamed)'
+            :d.source.split(/[\\/]/).pop()));
       $('namechip').textContent=(d.camera_on?'':'OFF · ')+label;
       if(digit&&camSelected!==d.source&&!$('camdd').classList.contains('open')){
         camSelected=d.source;renderCamMenu();}
@@ -1854,11 +1907,33 @@ async function poll(){
       // fresh page load) goes stale the moment a video's been left running
       // from an earlier session, so clicking the already-highlighted Live
       // Camera tab silently did nothing. This tracks the server's own idea
-      // of the mode instead. Also syncs which tab is VISIBLE the first time
-      // (page load / refresh) so a page opened onto a playing upload shows
-      // the Upload tab, not a stale default.
-      const trueMode=(digit||d.source==='browser')?'camera':'upload';
-      if(!modeSynced){selectTab(trueMode);modeSynced=true;}
+      // of the mode instead.
+      // '' means disarmed (nothing successfully armed yet) — that's a
+      // Camera-tab state (standby), never a reason to flip to Upload.
+      // A digit source is only UNAMBIGUOUS proof of "camera" while it's
+      // actually streaming (camera_on) — an armed-but-off camera index is
+      // also exactly what `source` still reads right after clicking Upload
+      // Video (that click turns the camera off but never clears which
+      // device was remembered). Treating "digit" alone as proof of camera
+      // mode (2026-07-20 regression, found within minutes of shipping the
+      // fix below) fought that click every single poll, flipping straight
+      // back to Live Camera before an upload could ever happen. When it's
+      // genuinely ambiguous (armed, not streaming), don't force a
+      // direction — keep whatever the pill already shows.
+      const trueMode=(d.source===''||d.source==='browser'||(digit&&d.camera_on))?'camera'
+        :(digit?serverMode:'upload');
+      // Re-sync the VISIBLE tab pill on every poll whenever it disagrees
+      // with the real source, not just once at page load (2026-07-20 bug
+      // report, screenshotted): the source can change without a matching
+      // tab click — another connected viewer, a direct API call, the
+      // "Use this device camera" button — and the old one-shot-only sync
+      // left the tab pill (and, via poll()'s own per-cycle hazard-tile
+      // styling below, the red "active" highlighting) showing whichever
+      // source was last clicked while the actual live feed and alerts were
+      // from something else entirely — looked exactly like stale/leftover
+      // state even though the numbers themselves were live and correct.
+      if(trueMode!==serverMode){selectTab(trueMode);}
+      modeSynced=true;
       serverMode=trueMode;}
     if(d.camera_on!==undefined){
       camOn=d.camera_on;
@@ -1879,8 +1954,6 @@ async function poll(){
           ?'Camera ready ('+armedCam.label.split(' — ')[0]+') — press the camera button below to start'
           :'Pick a camera or upload a video to begin';}
       maybeAutoArmOnLoad();}
-    if(d.auto_off!==undefined&&document.activeElement!==$('autooff'))
-      $('autooff').checked=d.auto_off;
     if(d.mirror!==undefined){mirrored=d.mirror;
       $('flipbtn').classList.toggle('act',mirrored);}
     if(d.live_report){
@@ -1898,6 +1971,7 @@ async function switchSrc(v){
   if(!v)return;
   $('srcnow').textContent='Switching to '+v+' …';
   try{const r=await fetch('/switch?src='+encodeURIComponent(v));const d=await r.json();
+    clearLiveDisplay();  // a different camera is a new source too, same as a tab switch
     $('srcnow').textContent='Current source: '+d.source;}
   catch(e){$('srcnow').textContent='Switch failed: '+e;}}
 let camSelected='';
@@ -1999,6 +2073,7 @@ async function startDevCam(){
     {video:{width:{ideal:640},facingMode:'environment'},audio:false});}
   catch(e){$('srcnow').textContent='Camera permission denied.';return;}
   await fetch('/ingest?claim=1',{method:'POST'});
+  clearLiveDisplay();  // claiming this camera is a new source, same as a tab switch
   const v=document.createElement('video');
   v.srcObject=devStream;v.muted=true;v.playsInline=true;await v.play();
   const cv=document.createElement('canvas');
@@ -2049,6 +2124,42 @@ function selectTab(name){
     b.classList.toggle('on',b.dataset.tab===name));
   $('panel-camera').style.display=name==='camera'?'flex':'none';
   $('panel-upload').style.display=name==='upload'?'flex':'none';
+  // Camera on/off and mirror-flip are meaningless for an uploaded video
+  // (2026-07-20: cambtn's "on" click is the only thing that resumes
+  // `current`, which made it the accidental trigger for the stale-source
+  // bug — "Stop video" already covers off, there's no legitimate "resume
+  // via the camera icon" use case worth keeping visible here).
+  $('cambtn').style.display=name==='camera'?'':'none';
+  $('flipbtn').style.display=name==='camera'?'':'none';
+}
+// Any deliberate source change (tab switch, claiming the browser's own
+// camera) must feel instant, not wait ~1s for the next poll to catch up —
+// and must stop an old alert from talking/logging over the new source
+// (2026-07-20: "Use this device camera" was found NOT calling this at all,
+// so its old cooldown/log/voice state leaked into the new stream — every
+// other source-change entry point already went through /reset server-side,
+// this was the one client-side gap left duplicating none of it).
+function clearLiveDisplay(){
+  stopVoiceNow();           // an alert from the source you're leaving must not keep talking
+  $('viewwrap').classList.add('blanked');  // instant — don't wait for the server's
+  $('view').alt='';                        // placeholder frame to arrive over MJPEG
+  // New source, new session — old counts/log/report from a different
+  // video or camera would otherwise sit there looking current.
+  $('log').innerHTML='<li>No alerts yet.</li>';
+  $('incidents').innerHTML='<li>Scene notes appear here seconds after an alert fires.</li>';
+  $('livereport').style.display='none';$('livereport').textContent='';
+  // The manually-triggered report (#report, from the "Generate Report"
+  // button) is a separate element from #livereport (the auto-refreshed
+  // one during active monitoring) — missed here the first time (2026-07-20
+  // bug report): a report generated on an old video/camera sat visible,
+  // downloads and all, through every later source change.
+  $('report').style.display='none';$('report').textContent='';
+  ['dlpdf','dltxt','dljson'].forEach(id=>$(id).classList.remove('show'));
+  $('banner').classList.remove('on');
+  for(const k of['proximity','vehicle','height','ppe']){
+    $('n-'+k).textContent='0';$('hz-'+k).classList.remove('active');}
+  $('alerts').textContent='0';$('workers').textContent='0';$('vehicles').textContent='0';
+  lastAlert=Date.now()/1000;
 }
 document.querySelectorAll('.tabbtn').forEach(btn=>
   btn.onclick=async()=>{
@@ -2056,19 +2167,7 @@ document.querySelectorAll('.tabbtn').forEach(btn=>
     selectTab(target);
     if(serverMode!==target){
       stopDevCam();
-      stopVoiceNow();           // an alert from the mode you're leaving must not keep talking
-      $('viewwrap').classList.add('blanked');  // instant — don't wait for the server's
-      $('view').alt='';                        // placeholder frame to arrive over MJPEG
-      // New mode, new session — old counts/log/report from a different
-      // video or camera would otherwise sit there looking current.
-      $('log').innerHTML='<li>No alerts yet.</li>';
-      $('incidents').innerHTML='<li>Scene notes appear here seconds after an alert fires.</li>';
-      $('livereport').style.display='none';$('livereport').textContent='';
-      $('banner').classList.remove('on');
-      for(const k of['proximity','vehicle','height','ppe']){
-        $('n-'+k).textContent='0';$('hz-'+k).classList.remove('active');}
-      $('alerts').textContent='0';$('workers').textContent='0';$('vehicles').textContent='0';
-      lastAlert=Date.now()/1000;lastIncKey=null;
+      clearLiveDisplay();
       // Entering Camera: arm the recommended camera in ONE decisive call
       // instead of a bare /camera?on=0 (2026-07-19 bugs, both from the same
       // root cause — /camera?on=0 stops whatever was running but leaves
@@ -2079,8 +2178,19 @@ document.querySelectorAll('.tabbtn').forEach(btn=>
       // after switching could race this call's own async response, which
       // could land after and turn the just-started camera back off. /arm
       // both fixes `current` and removes the second stop-call entirely.
-      if(target==='camera' && await armRecommendedCamera()){/* armed */}
-      else{try{await Promise.all([fetch('/camera?on=0'),fetch('/reset')]);}catch(e){}}
+      if(target==='camera'){
+        // (2026-07-20) armRecommendedCamera() reads the client-side camList,
+        // which is only populated once the initial /cameras fetch resolves —
+        // switching tabs before that lands used to see an empty list, treat
+        // it as "no camera", and fall through to the else branch below
+        // without ever repointing `current` off the previous source.
+        if(!camList.length){try{await loadCams();}catch(e){}}
+        if(await armRecommendedCamera()){/* armed */}
+        else{try{await Promise.all(
+          [fetch('/camera?on=0'),fetch('/disarm'),fetch('/reset')]);}catch(e){}}
+      }else{
+        try{await Promise.all([fetch('/camera?on=0'),fetch('/reset')]);}catch(e){}
+      }
       $('srcnow').textContent='';
       serverMode=target;
     }});
@@ -2090,7 +2200,6 @@ $('cambtn').onclick=async()=>{
     $('cambtn').innerHTML=camOn?IC.cam:IC.camOff;
     $('cambtn').classList.toggle('off',!camOn);}
   catch(e){}};
-$('autooff').onchange=()=>fetch('/camera?auto='+($('autooff').checked?1:0));
 $('reportbtn').onclick=async()=>{
   const box=$('report');box.style.display='block';
   box.textContent='Generating safety report on the Spark…';
@@ -2148,6 +2257,14 @@ def parse_args():
 
 
 def main():
+    # stdout is fully block-buffered (not line-buffered) once it's a pipe
+    # rather than a TTY — e.g. `run_session.sh`'s `| tee logfile`. Every
+    # `[live] ...` print() in this module was silently invisible in the
+    # tee'd log until either the buffer filled or the process exited
+    # (2026-07-20: made a live "camera on/off" bug much harder to diagnose
+    # from the log alone — stderr tracebacks showed up fine, stdout diagnostics
+    # didn't). Force line buffering so operators can actually `tail -f` this.
+    sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
     if args.mock and args.device == "0":
         args.device = "cpu"
@@ -2166,6 +2283,33 @@ def main():
             print(f"[live] PPE detector disabled — weights not found at "
                   f"{config.PPE_MODEL_PATH} (no baseline PPE hazard; height "
                   "alarms will always fire, never suppressed)")
+
+    # Claim CUDA memory for the detector model(s) NOW, synchronously, before
+    # anything else on this Spark can compete for it (2026-07-20: a user
+    # arming the camera within seconds of startup raced YOLO's own *lazy*
+    # first-inference CUDA init — ultralytics only actually moves weights
+    # onto the GPU on the first real .predict() call, not at load time —
+    # against spark_status_poller's startup warm() call, which cold-loads
+    # the 116B-param report model in the background almost immediately.
+    # Combined memory pressure on this Grace-Blackwell's *unified* memory
+    # (no separate VRAM pool, see the Gotchas page) was severe enough to get
+    # the whole process OOM-killed outright — not a catchable Python
+    # exception, so the per-frame try/except in detection_loop can't help
+    # against it. Forcing YOLO to claim its (much smaller) share first,
+    # before the warm-up thread below even starts, removes the race
+    # entirely instead of narrowing its window.
+    import numpy as np
+    _blank = np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8)
+    try:
+        detector.predict_frame(_blank, conf=args.conf, imgsz=args.imgsz)
+        print("[live] detector CUDA context warmed")
+    except Exception as exc:
+        print(f"[live] detector warmup failed, will retry on first real frame: {exc!r}")
+    if ppe_detector is not None:
+        try:
+            ppe_detector.predict(_blank, conf=config.PPE_CONF, imgsz=args.imgsz)
+        except Exception as exc:
+            print(f"[live] PPE detector warmup failed, will retry on first real frame: {exc!r}")
 
     tts_voice = load_tts_voice()
 
@@ -2217,9 +2361,6 @@ def main():
     server = None
     try:
         if args.headless:
-            threading.Thread(target=camera_watchdog,
-                             args=(state, sources, out_slot, raw_slot),
-                             daemon=True).start()
             server = ThreadingHTTPServer(("0.0.0.0", args.port),
                                          make_handler(out_slot, state, sources,
                                                       raw_slot, in_slot, tts_voice))

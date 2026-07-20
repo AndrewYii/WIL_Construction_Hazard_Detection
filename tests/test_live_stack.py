@@ -210,6 +210,153 @@ def test_public_source_hides_internal_paths():
     assert public_source("C:/Users/User/Desktop/secret/site_demo.mp4") == "site_demo.mp4"
     assert public_source("/home/spark/clips/yard.mp4") == "yard.mp4"
     assert public_source("http://192.168.0.5:8080/video?token=abc") == "http://192.168.0.5"
+    assert public_source(None) == ""
+
+
+def test_disarm_clears_current_so_camera_on_cannot_resume_stale_source():
+    """Regression test (2026-07-20): entering Camera mode with no usable
+    camera found used to leave `current` pointed at whatever was active
+    before (e.g. an uploaded video), so a later camera-on press silently
+    replayed that video. disarm() must clear it so camera-on is a no-op."""
+    from live import LatestFrame, SourceManager
+    sources = SourceManager(LatestFrame())
+    sources.arm("/tmp/siteguard_upload/site_demo.mp4", loop_file=True)
+    sources.disarm()
+    assert sources.current is None
+    assert sources.camera_on is False
+    sources.set_camera(True)
+    assert sources.current is None
+    assert sources.camera_on is False
+
+
+def test_arm_stops_a_previously_running_capture_thread():
+    """Regression test (2026-07-20): entering Camera mode while an uploaded
+    video's CaptureThread was still running left it running in the
+    background — `current`/`camera_on` updated to look like standby, but
+    the video kept looping, feeding frames, and firing genuinely new
+    alerts into the freshly-cleared log the whole time, invisible only
+    because the client hides the still-updating view behind a placeholder.
+    arm() must stop whatever capture is active, exactly like start() and
+    use_browser() already do — it only ever meant to skip OPENING a new
+    device, not skip stopping the old one."""
+    import threading
+
+    from live import LatestFrame, SourceManager
+
+    sources = SourceManager(LatestFrame())
+
+    class FakeCapture:
+        def __init__(self):
+            self.stop_flag = threading.Event()
+            self.close_on_exit = True
+
+        def is_alive(self):
+            return not self.stop_flag.is_set()
+
+    fake = FakeCapture()
+    sources.capture = fake
+    sources.camera_on = True
+    sources.current = "/tmp/siteguard_upload/site_demo.mp4"
+
+    sources.arm(4)  # switching to the Live Camera tab, arming the RealSense
+
+    assert fake.stop_flag.is_set()  # the video's capture must be told to stop
+    assert sources.capture is None
+    assert sources.current == 4
+    assert sources.camera_on is False
+
+
+def test_claiming_browser_camera_clears_old_alerts_like_every_other_source_change():
+    """Regression test (2026-07-20): every source-change entry point
+    (/upload, /switch, /arm) calls state.reset_session() so the dashboard's
+    alert log/voice/active-hazard state starts clean on the new source.
+    /ingest?claim=1 (the "Use this device camera" button) was the one left
+    out — the old source's fired alerts and active hazards leaked into the
+    new stream, which is what the user was hearing/seeing. This asserts the
+    reset primitive the fix relies on actually clears what the dashboard
+    reads back via SessionState.snapshot()."""
+    from live import SessionState
+    from alerts import AlertEngine
+
+    state = SessionState(AlertEngine())
+    state.engine.fire_now("proximity", "Warning! Worker too close to vehicle.")
+    with state.lock:
+        state.active_hazards = ["proximity"]
+        state.workers_now = 2
+
+    snap_before = state.snapshot()
+    assert snap_before["recent_alerts"]
+    assert snap_before["active_hazards"] == ["proximity"]
+
+    state.reset_session()  # what the fixed /ingest claim branch now calls
+
+    snap_after = state.snapshot()
+    assert snap_after["recent_alerts"] == []
+    assert snap_after["active_hazards"] == []
+    assert snap_after["workers"] == 0
+
+
+def test_detection_loop_survives_a_transient_predictor_crash(monkeypatch):
+    """Regression test (2026-07-20): a single detector.predict_frame()
+    exception (the real trigger was a CUDA OOM from a warm Ollama model
+    still holding unified memory on the Spark) used to be unhandled and
+    killed the whole detection thread — nothing restarts a dead thread, so
+    the dashboard was stuck on the standby placeholder forever afterward,
+    indistinguishable from an actual unarmed-camera problem. The loop must
+    catch it, record state.detector_error, and keep processing later frames
+    on the same thread."""
+    import threading
+    import time as time_mod
+
+    import numpy as np
+    import live
+    from alerts import AlertEngine
+    from live import LatestFrame, SessionState, detection_loop
+
+    monkeypatch.setattr(live.time, "sleep", lambda *_: None)  # skip the real backoff
+
+    class FlakyDetector:
+        def __init__(self):
+            self.calls = 0
+
+        def predict_frame(self, frame, conf, imgsz):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("CUDA error: out of memory")
+            return []
+
+    class Args:
+        conf = 0.4
+        imgsz = 640
+        height_zone = False
+
+    in_slot, out_slot = LatestFrame(), LatestFrame()
+    state = SessionState(AlertEngine())
+    stop_flag = threading.Event()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    t = threading.Thread(target=detection_loop, args=(
+        Args(), FlakyDetector(), in_slot, out_slot, state, state.engine, stop_flag))
+    t.start()
+    try:
+        in_slot.put(frame)  # first call raises — must not kill the thread
+        deadline = time_mod.time() + 2
+        while state.detector_error is None and time_mod.time() < deadline:
+            time_mod.sleep(0.01)
+        assert state.detector_error is not None
+        assert "out of memory" in state.detector_error
+        assert t.is_alive()
+
+        in_slot.put(frame)  # second call succeeds on the same thread
+        deadline = time_mod.time() + 2
+        while state.frames == 0 and time_mod.time() < deadline:
+            time_mod.sleep(0.01)
+        assert state.frames >= 1
+        assert state.detector_error is None
+    finally:
+        stop_flag.set()
+        in_slot.close()
+        t.join(timeout=2)
 
 
 def test_annotate_marks_ppe_violator_red_despite_stale_box():
@@ -405,6 +552,30 @@ def test_resolve_picks_first_available(monkeypatch):
     monkeypatch.setattr(client, "available_models",
                         lambda cache_sec=0: ["llava:7b", "qwen3:32b"])
     assert client.resolve(["gpt-oss:120b", "qwen3:32b", "llava:7b"]) == "qwen3:32b"
+
+
+def test_warm_loads_both_report_and_vlm_models(monkeypatch):
+    """warm() pre-loads both chains so neither pays a cold-load on first
+    real use. Only safe on the Spark because REPORT_MODELS' default first
+    choice (gemma4:31b, ~19GB) is small enough to sit alongside the resolved
+    VLM model (~71GB) well within 121GB total unified memory — see the
+    REPORT_MODELS comment in config.py and the 2026-07-20 Gotchas entry for
+    why this used to OOM-kill the whole process when REPORT_MODELS defaulted
+    to gpt-oss:120b (~65GB) instead."""
+    import config
+    client = SparkLLM(host="http://test:11434")
+    monkeypatch.setattr(client, "available_models",
+                        lambda cache_sec=0: [config.REPORT_MODELS[0], config.VLM_MODELS[0]])
+    monkeypatch.setattr(client, "_caps", {config.VLM_MODELS[0]: {"vision"}})
+    calls = []
+
+    class FakeClient:
+        def generate(self, model, prompt, think, keep_alive):
+            calls.append(model)
+
+    monkeypatch.setattr(client, "_get_client", lambda: FakeClient())
+    client.warm()
+    assert calls == [config.REPORT_MODELS[0], config.VLM_MODELS[0]]
 
 
 def test_resolve_matches_bare_name_to_tagged(monkeypatch):

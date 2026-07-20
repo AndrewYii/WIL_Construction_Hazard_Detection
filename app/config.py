@@ -39,9 +39,19 @@ OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "120"))
 
 # --- Model preference chains (first available on the server wins) --------
 # Pull on the Spark with:  ollama pull gpt-oss:120b   etc. (docs/SPARK_SETUP.md)
+# gemma4:31b (19GB on disk) leads gpt-oss:120b (65GB) here, not the other way
+# round (2026-07-20): gpt-oss:120b alongside a warm VLM_MODELS pick (71GB for
+# qwen3.6:35b-a3b-bf16) overcommits this Spark's 121GB unified memory — see
+# the Gotchas page — so SparkLLM.warm() only pre-warms VLM_MODELS and leaves
+# REPORT_MODELS to cold-load lazily on first /report request. Putting
+# gemma4:31b first means that lazy load is small enough to be fast AND still
+# small enough to warm safely alongside the VLM if warm() is ever extended to
+# cover both again. gpt-oss:120b stays in the chain as a fallback, and as an
+# explicit opt-in via REPORT_MODELS=gpt-oss:120b,... for anyone who wants its
+# extra quality and is fine trading report latency for it.
 REPORT_MODELS = [
     m.strip() for m in os.environ.get(
-        "REPORT_MODELS", "gpt-oss:120b,gemma4:31b,qwen3:32b,llama3.3:70b,llava:7b"
+        "REPORT_MODELS", "gemma4:31b,qwen3:32b,gpt-oss:120b,llama3.3:70b,llava:7b"
     ).split(",") if m.strip()
 ]
 VLM_MODELS = [
@@ -90,6 +100,13 @@ ALERT_TRIGGER_FRAMES = int(os.environ.get("ALERT_TRIGGER_FRAMES", "3"))
 ALERT_COOLDOWN_SEC = float(os.environ.get("ALERT_COOLDOWN_SEC", "8"))
 # On-the-spot AI analysis: min seconds between automatic live-report rewrites
 REPORT_REFRESH_SEC = float(os.environ.get("REPORT_REFRESH_SEC", "45"))
+# Report output length cap (tokens). Directly trades length for wall-clock
+# time: on the Spark, gemma4:31b (REPORT_MODELS' default first choice)
+# sustains ~9.3 tok/s once warm — measured 2026-07-20, see the Gotchas page —
+# so 260 targets a condensed-but-complete report under ~30s; the previous
+# 900 (a fuller, more elaborated report) took ~90-100s for the same content
+# depth per section.
+REPORT_NUM_PREDICT = int(os.environ.get("REPORT_NUM_PREDICT", "260"))
 AUDIO_DIR = PROJECT_ROOT / "assets" / "audio"
 EVENTS_LOG = PROJECT_ROOT / "logs" / "events.jsonl"
 
