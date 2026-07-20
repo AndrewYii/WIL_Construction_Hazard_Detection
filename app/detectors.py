@@ -9,6 +9,7 @@ subclass BaseDetector and add one entry to DETECTOR_REGISTRY.
 
 from pathlib import Path
 
+import config
 from hazard_logic import Detection
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -207,10 +208,12 @@ class _GroundingDINO:
 
 
 class PlanDDetector(BaseDetector):
-    """Direct VLM (llava via local Ollama) for per-frame hazard reasoning,
-    with Grounding DINO supplying the bounding boxes the VLM cannot produce
-    reliably itself (IoU < 20% in the literature). Roughly 1 s per sampled
-    frame — use a high frame skip and short clips."""
+    """Direct VLM for per-frame hazard reasoning, served by the Ollama
+    server on the DGX Spark (config.VLM_MODELS chain, default
+    qwen2.5vl:32b -> gemma3:27b -> llava:7b), with Grounding DINO supplying
+    the bounding boxes the VLM cannot produce reliably itself (IoU < 20% in
+    the literature). Roughly 1 s per sampled frame — use a high frame skip
+    and short clips."""
 
     key = "plan_d"
     label = "Plan D — Direct VLM"
@@ -224,8 +227,8 @@ class PlanDDetector(BaseDetector):
     )
 
     def load(self):
-        import ollama
-        self._ollama = ollama
+        from llm_client import get_client
+        self._llm = get_client()
         self._grounder = _GroundingDINO.get(self.device)
         return self
 
@@ -241,23 +244,23 @@ class PlanDDetector(BaseDetector):
         if not ok:
             return {"workers": 0, "vehicles": 0, "hazard": False,
                     "note": "encode failed", "detections": detections}
-        try:
-            response = self._ollama.chat(
-                model="llava:7b",
-                messages=[{"role": "user", "content": self.PROMPT, "images": [buf.tobytes()]}],
-            )
-            match = re.search(r"\{.*\}", response["message"]["content"], re.DOTALL)
-            parsed = json.loads(match.group(0)) if match else {}
-            return {
-                "workers": int(parsed.get("workers", 0)),
-                "vehicles": int(parsed.get("vehicles", 0)),
-                "hazard": bool(parsed.get("proximity_hazard", False)),
-                "note": "VLM + DINO boxes",
-                "detections": detections,
-            }
-        except Exception:
-            return {"workers": 0, "vehicles": 0, "hazard": False,
-                    "note": "VLM unavailable, DINO boxes only", "detections": detections}
+        text = self._llm.describe_image(self.PROMPT, buf.tobytes())
+        if text:
+            try:
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                parsed = json.loads(match.group(0)) if match else {}
+                model = self._llm.resolve(config.VLM_MODELS, need="vision") or "VLM"
+                return {
+                    "workers": int(parsed.get("workers", 0)),
+                    "vehicles": int(parsed.get("vehicles", 0)),
+                    "hazard": bool(parsed.get("proximity_hazard", False)),
+                    "note": f"{model} + DINO boxes",
+                    "detections": detections,
+                }
+            except Exception:
+                pass
+        return {"workers": 0, "vehicles": 0, "hazard": False,
+                "note": "VLM unavailable, DINO boxes only", "detections": detections}
 
 
 class PlanEDetector(BaseDetector):
@@ -318,6 +321,42 @@ class PlanEDetector(BaseDetector):
         return {"workers": workers, "vehicles": vehicles, "hazard": anomalous,
                 "note": f"anomaly score {score:.2f}" + (" + DINO boxes" if anomalous else ""),
                 "detections": detections}
+
+
+class PPEDetector:
+    """Wraps PPE_Detect/best.pt (Roboflow-style Hardhat/Safety Vest/boots/
+    gloves detector) used by live.py for the baseline PPE-compliance hazard
+    and the height-alarm cross-check. Not a worker/vehicle Plan, so it stays
+    out of DETECTOR_REGISTRY — live.py loads it directly by path."""
+
+    def __init__(self, weights_path: str, device: str = "0"):
+        self.weights_path = str(weights_path)
+        self.device = device
+        self.model = None
+        self.names: dict[int, str] = {}
+
+    def load(self):
+        from ultralytics import YOLO
+        self.model = YOLO(self.weights_path)
+        self.names = self.model.names
+        return self
+
+    def predict(self, frame, conf: float, imgsz: int = 416) -> list[dict]:
+        """Returns [{'name': str, 'conf': float, 'xyxy': (x1,y1,x2,y2)}, ...]
+        using the model's own class names — never hardcode its class ids,
+        they're specific to this weight file."""
+        quantize = "fp16" if self.device != "cpu" else None
+        result = self.model.predict(
+            frame, imgsz=imgsz, conf=conf, device=self.device, quantize=quantize, verbose=False
+        )[0]
+        out = []
+        if result.boxes is not None:
+            for box in result.boxes:
+                cls_id = int(box.cls.item())
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+                out.append({"name": self.names.get(cls_id, str(cls_id)),
+                           "conf": float(box.conf.item()), "xyxy": (x1, y1, x2, y2)})
+        return out
 
 
 DETECTOR_REGISTRY: dict[str, type[BaseDetector]] = {

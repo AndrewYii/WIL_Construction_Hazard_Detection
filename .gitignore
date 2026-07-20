@@ -21,4 +21,8 @@ build/
 *.tar.gz
 *.mp4
 *.docx
+logs/
+assets/audio/
+assets/tts_voices/
+PPE_Detect/
 

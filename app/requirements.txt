@@ -1,4 +1,3 @@
-streamlit
 opencv-python-headless
 ultralytics
 ollama
@@ -6,3 +5,7 @@ transformers
 scikit-learn
 imageio-ffmpeg
 fpdf2
+pyttsx3
+piper-tts
+python-dotenv
+pygrabber; sys_platform == 'win32'
